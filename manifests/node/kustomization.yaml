@@ -31,3 +31,7 @@ resources:
   # Device plugin to allow non-privileged containers to use /dev/uinput
   # Required for virtual mouse (capture) and gamepad support.
   - uinput-device-plugin.yaml
+
+  # GPU sharing aware auto-scaler
+  - gpu-sharing-autoscaler-controller.yaml
+  - gpu-sharing-autoscaler-rs.yaml

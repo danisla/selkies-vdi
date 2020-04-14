@@ -1,0 +1,103 @@
+# Copyright 2019 Google Inc. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gpu-sharing-autoscaler-controller
+  namespace: kube-system
+  labels:
+    app: gpu-sharing-autoscaler-controller
+---
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1beta1
+metadata:
+  name: gpu-sharing-autoscaler-controller
+  labels:
+    app: gpu-sharing-autoscaler-controller
+subjects:
+  - kind: ServiceAccount
+    name: gpu-sharing-autoscaler-controller
+    namespace: kube-system
+roleRef:
+  kind: ClusterRole
+  name: gpu-sharing-autoscaler-controller
+  apiGroup: rbac.authorization.k8s.io
+---
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1beta1
+metadata:
+  name: gpu-sharing-autoscaler-controller
+  labels:
+    app: gpu-sharing-autoscaler-controller
+rules:
+  - apiGroups: [""] # "" indicates the core API group
+    resources: ["pods"]
+    verbs: ["*"]
+  - apiGroups: ["apps"]
+    resources: ["replicasets", "replicasets/scale"]
+    verbs: ["*"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gpu-sharing-autoscaler-controller
+spec:
+  selector:
+    app: gpu-sharing-autoscaler-controller
+  type: ClusterIP
+  clusterIP: None
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: gpu-sharing-autoscaler-controller
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      app: gpu-sharing-autoscaler-controller
+  serviceName: gpu-sharing-autoscaler-controller
+  replicas: 1
+  volumeClaimTemplates: []
+  template:
+    metadata:
+      labels:
+        app: gpu-sharing-autoscaler-controller
+    spec:
+      serviceAccount: gpu-sharing-autoscaler-controller
+      containers:
+        - name: controller
+          image: gcr.io/${PROJECT_ID}/webrtc-gpu-streaming-gpu-sharing-autoscaler-controller:latest
+          env:
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: NUM_GPU_RESOURCES_PER_POD
+              # Derived from number of containers consuming GPU resources.
+              value: "3"
+            - name: NUM_GPUS_PER_NODE
+              # Derived from parameterized value in gpu-sharing DaemonSet
+              value: "48"
+            - name: GPU_POD_SELECTOR
+              value: "app.kubernetes.io/managed-by=pod-broker,app=vdi"
+            - name: REPLICASET_SELECTOR
+              value: "k8s-app=gpu-sharing-autoscaler"
+            - name: TARGET_GPU_NODE_UTILIZATION
+              # 1 pod per node: 1 * (NUM_GPU_RESOURCES_PER_POD / NUM_GPUS_PER_NODE) = 0.0625 => 6%.
+              value: "6"
+            - name: MIN_IDLE_NODES
+              # Minimum number of nodes beyond what is calculated by the utilization to provision.
+              value: "1"
