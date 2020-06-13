@@ -12,9 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import asyncio
-import base64
-import json
 import logging
 
 import gi
@@ -25,47 +22,38 @@ from gi.repository import Gst
 from gi.repository import GstWebRTC
 from gi.repository import GstSdp
 
-logger = logging.getLogger("gstwebrtc_app")
+logger = logging.getLogger("gstwebrtc_pipeline")
 
 
-class GSTWebRTCAppError(Exception):
+class GSTX11StreamingPipelineError(Exception):
     pass
 
 
-class GSTWebRTCApp:
-    def __init__(self, stun_server=None, turn_servers=None, audio=True, framerate=30, encoder=None):
-        """Initialize gstreamer webrtc app.
+class GSTX11StreamingPipeline:
+    def __init__(self, audio=True, framerate=30, encoder=None, video_bitrate=2000, audio_bitrate=64000, pointer_visible=0, resolution=None):
+        """Initializes the GStreamer X11 streaming pipeline
 
-        Initializes GObjects and checks for required plugins.
-
-        Arguments:
-            stun_server {[string]} -- Optional STUN server uri in the form of:
-                                    stun:<host>:<port>
-            turn_servers {[list of strings]} -- Optional TURN server uris in the form of:
-                                    turn://<user>:<password>@<host>:<port>
+        Keyword Arguments:
+            audio {bool} -- Enable audio pipeline (default: {True})
+            framerate {int} -- X11 capture framerate (default: {30})
         """
 
-        self.stun_server = stun_server
-        self.turn_servers = turn_servers
         self.audio = audio
-        self.pipeline = None
-        self.webrtcbin = None
-        self.data_channel = None
-        self.encoder = encoder
-
         self.framerate = framerate
+        self.encoder = encoder
+        if self.encoder is None:
+            self.encoder = "nvh264enc"
+        self.video_bitrate = video_bitrate
+        self.audio_bitrate = audio_bitrate
+        self.pointer_visible = pointer_visible
+        self.resolution = resolution
 
-        # WebRTC ICE and SDP events
-        self.on_ice = lambda mlineindex, candidate: logger.warn(
-            'unhandled ice event')
-        self.on_sdp = lambda sdp_type, sdp: logger.warn('unhandled sdp event')
+        self.on_linked = lambda gstwebrtcbin: logger.warning("unhandled on_linked")
 
-        # Data channel events
-        self.on_data_open = lambda: logger.warn('unhandled on_data_open')
-        self.on_data_close = lambda: logger.warn('unhandled on_data_close')
-        self.on_data_error = lambda: logger.warn('unhandled on_data_error')
-        self.on_data_message = lambda msg: logger.warn(
-            'unhandled on_data_message')
+        self.pipeline = None
+        self.video_tee = None
+        self.audio_tee = None
+        self.peers = 0
 
         Gst.init(None)
 
@@ -75,43 +63,36 @@ class GSTWebRTCApp:
         # see build_video_pipeline() and build_audio_pipeline()
         self.pipeline = Gst.Pipeline.new()
 
-    # [START build_webrtcbin_pipeline]
-    def build_webrtcbin_pipeline(self):
-        """Adds the webrtcbin elments to the pipeline.
+        # Construct the media pipeline with video and audio.
+        self.build_video_pipeline()
 
-        The video and audio pipelines are linked to this in the
-            build_video_pipline() and build_audio_pipeline() methods.
+        if self.audio:
+            self.build_audio_pipeline()
+
+    def check_plugins(self):
+        """Check for required gstreamer plugins.
+
+        Raises:
+            GSTX11StreamingPipelineError -- thrown if any plugins are missing.
         """
 
-        # Create webrtcbin element named app
-        self.webrtcbin = Gst.ElementFactory.make("webrtcbin", "app")
+        required = ["opus", "nice", "webrtc", "dtls", "srtp", "rtp", "sctp",
+                    "rtpmanager", "ximagesrc"]
 
-        # The bundle policy affects how the SDP is generated.
-        # This will ultimately determine how many tracks the browser receives.
-        # Setting this to max-compat will generate separate tracks for
-        # audio and video.
-        # See also: https://webrtcstandards.info/sdp-bundle/
-        self.webrtcbin.set_property("bundle-policy", "max-compat")
+        supported = ["nvh264enc", "vp8enc", "vp9enc"]
+        if self.encoder not in supported:
+            raise GSTX11StreamingPipelineError('Unsupported encoder, must be one of: ' + ','.join(supported))
 
-        # Connect signal handlers
-        self.webrtcbin.connect(
-            'on-negotiation-needed', lambda webrtcbin: self.__on_negotiation_needed(webrtcbin))
-        self.webrtcbin.connect('on-ice-candidate', lambda webrtcbin, mlineindex,
-                               candidate: self.__send_ice(webrtcbin, mlineindex, candidate))
+        if self.encoder.startswith("nv"):
+            required.append("nvcodec")
 
-        # Add STUN server
-        if self.stun_server:
-            self.webrtcbin.set_property("stun-server", self.stun_server)
+        if self.encoder.startswith("vp"):
+            required.append("vpx")
 
-        # Add TURN server
-        if self.turn_servers:
-            for turn_server in self.turn_servers:
-                logger.info("adding TURN server: %s" % turn_server)
-                self.webrtcbin.emit("add-turn-server", turn_server)
-
-        # Add element to the pipeline.
-        self.pipeline.add(self.webrtcbin)
-    # [END build_webrtcbin_pipeline]
+        missing = list(
+            filter(lambda p: Gst.Registry.get().find_plugin(p) is None, required))
+        if missing:
+            raise GSTX11StreamingPipelineError('Missing gstreamer plugins:', missing)
 
     # [START build_video_pipeline]
     def build_video_pipeline(self):
@@ -133,7 +114,7 @@ class GSTWebRTCApp:
         # for example if the user is viewing full screen in the browser,
         # they may want to revert to seeing the remote cursor when the
         # client side cursor disappears.
-        ximagesrc.set_property("show-pointer", 0)
+        ximagesrc.set_property("show-pointer", self.pointer_visible)
 
         # Tells GStreamer that you are using an X11 window manager or
         # compositor with off-screen buffer. If you are not using a
@@ -198,7 +179,7 @@ class GSTWebRTCApp:
             # set_video_bitrate() method. This helps to match the available
             # bandwidth. If set too high, the cliend side jitter buffer will
             # not be unable to lock on to the stream and it will fail to render.
-            nvh264enc.set_property("bitrate", 2000)
+            nvh264enc.set_property("bitrate", self.video_bitrate)
 
             # Rate control mode tells the encoder how to compress the frames to
             # reach the target bitrate. A Constant Bit Rate (CBR) setting is best
@@ -317,11 +298,16 @@ class GSTWebRTCApp:
             vpenc.set_property("target-bitrate", 2000*1000)
 
         else:
-            raise GSTWebRTCAppError("Unsupported encoder for pipeline: %s" % self.encoder)
+            raise GSTX11StreamingPipelineError("Unsupported encoder for pipeline: %s" % self.encoder)
+
+
+        # Create tee for video
+        self.video_tee = Gst.ElementFactory.make("tee", "video_tee")
 
         # Add all elements to the pipeline.
         self.pipeline.add(ximagesrc)
         self.pipeline.add(ximagesrc_capsfilter)
+        self.pipeline.add(self.video_tee)
 
         if self.encoder == "nvh264enc":
             self.pipeline.add(cudaupload)
@@ -343,78 +329,81 @@ class GSTWebRTCApp:
         # Link the pipeline elements and raise exception of linking fails
         # due to incompatible element pad capabilities.
         if not Gst.Element.link(ximagesrc, ximagesrc_capsfilter):
-            raise GSTWebRTCAppError("Failed to link ximagesrc -> ximagesrc_capsfilter")
+            raise GSTX11StreamingPipelineError("Failed to link ximagesrc -> ximagesrc_capsfilter")
 
         if self.encoder == "nvh264enc":
             if not Gst.Element.link(ximagesrc_capsfilter, cudaupload):
-                raise GSTWebRTCAppError(
+                raise GSTX11StreamingPipelineError(
                     "Failed to link ximagesrc_capsfilter -> cudaupload")
 
             if not Gst.Element.link(cudaupload, cudaconvert):
-                raise GSTWebRTCAppError(
+                raise GSTX11StreamingPipelineError(
                     "Failed to link cudaupload -> cudaconvert")
 
             if not Gst.Element.link(cudaconvert, cudaconvert_capsfilter):
-                raise GSTWebRTCAppError(
+                raise GSTX11StreamingPipelineError(
                     "Failed to link cudaconvert -> cudaconvert_capsfilter")
 
             if not Gst.Element.link(cudaconvert_capsfilter, nvh264enc):
-                raise GSTWebRTCAppError(
+                raise GSTX11StreamingPipelineError(
                     "Failed to link cudaconvert_capsfilter -> nvh264enc")
 
             if not Gst.Element.link(nvh264enc, nvh264enc_capsfilter):
-                raise GSTWebRTCAppError(
+                raise GSTX11StreamingPipelineError(
                     "Failed to link nvh264enc -> nvh264enc_capsfilter")
 
             if not Gst.Element.link(nvh264enc_capsfilter, rtph264pay):
-                raise GSTWebRTCAppError(
+                raise GSTX11StreamingPipelineError(
                     "Failed to link nvh264enc_capsfilter -> rtph264pay")
 
             if not Gst.Element.link(rtph264pay, rtph264pay_capsfilter):
-                raise GSTWebRTCAppError(
+                raise GSTX11StreamingPipelineError(
                     "Failed to link rtph264pay -> rtph264pay_capsfilter")
-
-            # Link the last element to the webrtcbin
-            if not Gst.Element.link(rtph264pay_capsfilter, self.webrtcbin):
-                raise GSTWebRTCAppError(
-                    "Failed to link rtph264pay_capsfilter -> webrtcbin")
+           
+            # Link the last element to the video_tee
+            if not Gst.Element.link(rtph264pay_capsfilter, self.video_tee):
+                raise GSTX11StreamingPipelineError(
+                    "Failed to link rtph264pay_capsfilter -> video_tee")
 
         elif self.encoder.startswith("vp"):
             if not Gst.Element.link(ximagesrc_capsfilter, videoconvert):
-                raise GSTWebRTCAppError(
+                raise GSTX11StreamingPipelineError(
                     "Failed to link ximagesrc_capsfilter -> videoconvert")
 
             if not Gst.Element.link(videoconvert, videoconvert_capsfilter):
-                raise GSTWebRTCAppError(
+                raise GSTX11StreamingPipelineError(
                     "Failed to link videoconvert -> videoconvert_capsfilter")
 
             if not Gst.Element.link(videoconvert_capsfilter, vpenc):
-                raise GSTWebRTCAppError(
+                raise GSTX11StreamingPipelineError(
                     "Failed to link videoconvert_capsfilter -> vpenc")
 
             if not Gst.Element.link(vpenc, vpenc_capsfilter):
-                raise GSTWebRTCAppError(
+                raise GSTX11StreamingPipelineError(
                     "Failed to link vpenc -> vpenc_capsfilter")
 
             if not Gst.Element.link(vpenc_capsfilter, rtpvppay):
-                raise GSTWebRTCAppError(
+                raise GSTX11StreamingPipelineError(
                     "Failed to link vpenc_capsfilter -> rtpvppay")
 
             if not Gst.Element.link(rtpvppay, rtpvppay_capsfilter):
-                raise GSTWebRTCAppError(
+                raise GSTX11StreamingPipelineError(
                     "Failed to link rtpvppay -> rtpvppay_capsfilter")
 
-            # Link the last element to the webrtcbin
-            if not Gst.Element.link(rtpvppay_capsfilter, self.webrtcbin):
-                raise GSTWebRTCAppError(
-                    "Failed to link rtpvppay_capsfilter -> webrtcbin")
-
+            # Link the last element to the video_tee
+            if not Gst.Element.link(rtpvppay_capsfilter, self.video_tee):
+                raise GSTX11StreamingPipelineError(
+                    "Failed to link rtpvppay_capsfilter -> video_tee")
+    
     # [END build_video_pipeline]
 
     # [START build_audio_pipeline]
     def build_audio_pipeline(self):
         """Adds the RTP audio stream to the pipeline.
         """
+
+        # Create the audio tee element
+        self.audio_tee = Gst.ElementFactory.make("tee", "audio_tee")
 
         # Create element for receiving audio from pulseaudio.
         pulsesrc = Gst.ElementFactory.make("pulsesrc", "pulsesrc")
@@ -435,7 +424,7 @@ class GSTWebRTCApp:
 
         # Set audio bitrate to 64kbps.
         # This can be dynamically changed using set_audio_bitrate()
-        opusenc.set_property("bitrate", 64000)
+        opusenc.set_property("bitrate", self.audio_bitrate)
 
         # Create the rtpopuspay element to convert buffers into
         # RTP packets that are sent over the connection transport.
@@ -482,96 +471,136 @@ class GSTWebRTCApp:
         self.pipeline.add(rtpopuspay)
         self.pipeline.add(rtpopuspay_queue)
         self.pipeline.add(rtpopuspay_capsfilter)
+        self.pipeline.add(self.audio_tee)
 
         # Link the pipeline elements and raise exception of linking fails
         # due to incompatible element pad capabilities.
         if not Gst.Element.link(pulsesrc, opusenc):
-            raise GSTWebRTCAppError("Failed to link pulsesrc -> opusenc")
+            raise GSTX11StreamingPipelineError("Failed to link pulsesrc -> opusenc")
 
         if not Gst.Element.link(opusenc, rtpopuspay):
-            raise GSTWebRTCAppError("Failed to link opusenc -> rtpopuspay")
+            raise GSTX11StreamingPipelineError("Failed to link opusenc -> rtpopuspay")
 
         if not Gst.Element.link(rtpopuspay, rtpopuspay_queue):
-            raise GSTWebRTCAppError("Failed to link rtpopuspay -> rtpopuspay_queue")
+            raise GSTX11StreamingPipelineError("Failed to link rtpopuspay -> rtpopuspay_queue")
 
         if not Gst.Element.link(rtpopuspay_queue, rtpopuspay_capsfilter):
-            raise GSTWebRTCAppError(
+            raise GSTX11StreamingPipelineError(
                 "Failed to link rtpopuspay_queue -> rtpopuspay_capsfilter")
 
-        # Link the last element to the webrtcbin
-        if not Gst.Element.link(rtpopuspay_capsfilter, self.webrtcbin):
-            raise GSTWebRTCAppError(
-                "Failed to link rtpopuspay_capsfilter -> webrtcbin")
+        # Link the last element to the audio_tee
+        if not Gst.Element.link(rtpopuspay_capsfilter, self.audio_tee):
+            raise GSTX11StreamingPipelineError(
+                "Failed to link rtpopuspay_capsfilter -> audio_tee")
+
     # [END build_audio_pipeline]
 
-    def check_plugins(self):
-        """Check for required gstreamer plugins.
-
-        Raises:
-            GSTWebRTCAppError -- thrown if any plugins are missing.
-        """
-
-        required = ["opus", "nice", "webrtc", "dtls", "srtp", "rtp", "sctp",
-                    "rtpmanager", "ximagesrc"]
-
-        supported = ["nvh264enc", "vp8enc", "vp9enc"]
-        if self.encoder not in supported:
-            raise GSTWebRTCAppError('Unsupported encoder, must be one of: ' + ','.join(supported))
-
-        if self.encoder.startswith("nv"):
-            required.append("nvcodec")
-
-        if self.encoder.startswith("vp"):
-            required.append("vpx")
-
-        missing = list(
-            filter(lambda p: Gst.Registry.get().find_plugin(p) is None, required))
-        if missing:
-            raise GSTWebRTCAppError('Missing gstreamer plugins:', missing)
-
-    def set_sdp(self, sdp_type, sdp):
-        """Sets remote SDP received by peer.
+    def add_peer(self, gstwebrtcbin):
+        """Adds the given gstwebrtcbin to the pipeline with a queue
 
         Arguments:
-            sdp_type {string} -- type of sdp, offer or answer
-            sdp {object} -- SDP object
-
-        Raises:
-            GSTWebRTCAppError -- thrown if SDP is recevied before session has been started.
-            GSTWebRTCAppError -- thrown if SDP type is not 'answer', this script initiates the call, not the peer.
+            webrtcbin {GstElement} -- the gstwebrtc bin element
         """
 
-        if not self.webrtcbin:
-            raise GSTWebRTCAppError('Received SDP before session started')
+        assert self.pipeline
+        assert self.video_tee
+        assert gstwebrtcbin.webrtcbin
+        assert gstwebrtcbin.video_queue
 
-        if sdp_type != 'answer':
-            raise GSTWebRTCAppError('ERROR: sdp type was not "answer"')
+        # Add video elements to the pipeline.
+        self.pipeline.add(gstwebrtcbin.video_queue)
+        self.pipeline.add(gstwebrtcbin.webrtcbin)
 
-        _, sdpmsg = GstSdp.SDPMessage.new()
-        GstSdp.sdp_message_parse_buffer(bytes(sdp.encode()), sdpmsg)
-        answer = GstWebRTC.WebRTCSessionDescription.new(
-            GstWebRTC.WebRTCSDPType.ANSWER, sdpmsg)
-        promise = Gst.Promise.new()
-        self.webrtcbin.emit('set-remote-description', answer, promise)
-        promise.interrupt()
+        # Link the video_tee to the video_queue.
+        if not Gst.Element.link(self.video_tee, gstwebrtcbin.video_queue):
+            raise GSTX11StreamingPipelineError(
+                "Failed to link video_tee -> video_queue")
 
-    def set_ice(self, mlineindex, candidate):
-        """Adds ice candidate received from signalling server
+        # Link the video_queue to the webrtcbin.
+        if not Gst.Element.link(gstwebrtcbin.video_queue, gstwebrtcbin.webrtcbin):
+            raise GSTX11StreamingPipelineError(
+                "Failed to link video_queue -> webrtcbin")
 
-        Arguments:
-            mlineindex {integer} -- the mlineindex
-            candidate {string} -- the candidate
+        # Add audio elements to the pipeline.        
+        if self.audio:
+            assert self.audio_tee
+            assert gstwebrtcbin.audio_queue
 
-        Raises:
-            GSTWebRTCAppError -- thrown if called before session is started.
+            self.pipeline.add(gstwebrtcbin.audio_queue)
+
+            # Link the audio_tee to the audio_queue.
+            if not Gst.Element.link(self.audio_tee, gstwebrtcbin.audio_queue):
+                raise GSTX11StreamingPipelineError(
+                    "Failed to link audio_tee -> audio_queue")
+
+            # Link the audio_queue to the webrtcbin.
+            if not Gst.Element.link(gstwebrtcbin.audio_queue, gstwebrtcbin.webrtcbin):
+                raise GSTX11StreamingPipelineError(
+                    "Failed to link audio_queue -> webrtcbin")
+
+        logger.info("pipeline linked")
+
+        self.peers += 1
+
+        self.on_linked(gstwebrtcbin)
+
+    def del_webrtcbin(self, name):
+        # Rust Example: https://github.com/centricular/gstwebrtc-demos/blob/afb927c0facb3793767d4c1d8d247fd1709afe66/multiparty-sendrecv/gst-rust/src/main.rs#L516
+
+        if not self.pipeline:
+            return
+
+        logger.info("deleting peer from pipeline: %s" % name)
+
+        if self.peers == 1:
+            self.pipeline.set_state(Gst.State.READY)
+
+        # Fetch the elements to remove.
+        webrtcbin = Gst.Bin.get_by_name(self.pipeline, name)
+        webrtcbin_video_queue = Gst.Bin.get_by_name(self.pipeline, name + "_video_queue")
+
+        webrtcbin.set_state(Gst.State.NULL)
+        webrtcbin_video_queue.set_state(Gst.State.NULL)
+
+        if self.audio:
+            webrtcbin_audio_queue = Gst.Bin.get_by_name(self.pipeline, name + "_audio_queue")
+            webrtcbin_audio_queue.set_state(Gst.State.NULL)
+            self.pipeline.remove(webrtcbin_audio_queue)
+
+        self.pipeline.remove(webrtcbin_video_queue)
+        self.pipeline.remove(webrtcbin)
+
+        self.peers = max(0, self.peers - 1)
+
+        if self.peers == 0:
+            self.pipeline.set_state(Gst.State.NULL)
+
+    def stop_pipeline(self):
+        """Stops the gstreamer pipeline
         """
 
-        logger.info("setting ICE candidate: %d, %s" % (mlineindex, candidate))
+        if not self.pipeline:
+            return
 
-        if not self.webrtcbin:
-            raise GSTWebRTCAppError('Received ICE before session started')
+        # Advance the state of the pipeline to NULL.
+        res = self.pipeline.set_state(Gst.State.NULL)
+        if res.value_name != 'GST_STATE_CHANGE_SUCCESS':
+            raise GSTX11StreamingPipelineError(
+                "Failed to transition pipeline to NULL: %s" % res)
 
-        self.webrtcbin.emit('add-ice-candidate', mlineindex, candidate)
+        logger.info("pipeline started")        
+
+    def start_pipeline(self):
+        """Starts the gstreamer pipeline
+        """
+
+        # Advance the state of the pipeline to PLAYING.
+        res = self.pipeline.set_state(Gst.State.PLAYING)
+        if res.value_name != 'GST_STATE_CHANGE_SUCCESS':
+            raise GSTX11StreamingPipelineError(
+                "Failed to transition pipeline to PLAYING: %s" % res)
+
+        logger.info("pipeline started")
 
     def set_video_bitrate(self, bitrate):
         """Set NvEnc encoder target bitrate in bps
@@ -579,7 +608,7 @@ class GSTWebRTCApp:
         Arguments:
             bitrate {integer} -- bitrate in bits per second, for example, 2000 for 2kbits/s or 10000 for 1mbit/sec.
         """
-
+        
         if self.encoder.startswith("nv"):
             element = Gst.Bin.get_by_name(self.pipeline, "nvenc")
             element.set_property("bitrate", bitrate)
@@ -588,10 +617,7 @@ class GSTWebRTCApp:
             element.set_property("target-bitrate", bitrate*1000)
         else:
             logger.warning("set_video_bitrate not supported with encoder: %s" % self.encoder)
-
-        self.__send_data_channel_message(
-            "pipeline", {"status": "Video bitrate set to: %d" % bitrate})
-
+    
     def set_audio_bitrate(self, bitrate):
         """Set Opus encoder target bitrate in bps
 
@@ -599,11 +625,10 @@ class GSTWebRTCApp:
             bitrate {integer} -- bitrate in bits per second, for example, 96000 for 96kbits/s.
         """
 
-        if self.audio:
-            element = Gst.Bin.get_by_name(self.pipeline, "opusenc")
+        element = Gst.Bin.get_by_name(self.pipeline, "opusenc")
+        if element:
             element.set_property("bitrate", bitrate)
-            self.__send_data_channel_message(
-                "pipeline", {"status": "Audio bitrate set to: %d" % bitrate})
+            self.audio_bitrate = bitrate
 
     def set_pointer_visible(self, visible):
         """Set pointer visibiltiy on the ximagesrc element
@@ -614,156 +639,8 @@ class GSTWebRTCApp:
 
         element = Gst.Bin.get_by_name(self.pipeline, "x11")
         element.set_property("show-pointer", visible)
-        self.__send_data_channel_message(
-            "pipeline", {"status": "Set pointer visibility to: %d" % visible})
+        self.pointer_visible = visible
 
-    def send_clipboard_data(self, data):
-        self.__send_data_channel_message(
-            "clipboard", {"content": base64.b64encode(data.encode()).decode("utf-8")})
-
-    def send_gpu_stats(self, load, memory_total, memory_used):
-        """Sends GPU stats to the data channel
-
-        Arguments:
-            load {float} -- utilization of GPU between 0 and 1
-            memory_total {float} -- total memory on GPU in MB
-            memory_used {float} -- memor used on GPU in MB
-        """
-
-        self.__send_data_channel_message("gpu_stats", {
-            "load": load,
-            "memory_total": memory_total,
-            "memory_used": memory_used,
-        })
-
-    def send_reload_window(self):
-        """Sends reload window command to the data channel
-        """
-
-        logger.info("sending window reload")
-        self.__send_data_channel_message(
-            "system", {"action": "reload"})
-
-    def send_framerate(self, framerate):
-        """Sends the current frame rate to the data channel
-        """
-
-        logger.info("sending frame rate")
-        self.__send_data_channel_message(
-            "system", {"action": "framerate,"+str(framerate)})
-
-    def send_audio_enabled(self, audio_enabled):
-        """Sends the current audio state
-        """
-
-        logger.info("sending audio enabled")
-        self.__send_data_channel_message(
-            "system", {"action": "audio,"+str(audio_enabled)})
-
-    def is_data_channel_ready(self):
-        """Checks to see if the data channel is open.
-
-        Returns:
-            [bool] -- true if data channel is open
-        """
-
-        return self.data_channel and self.data_channel.get_property("ready-state").value_name == 'GST_WEBRTC_DATA_CHANNEL_STATE_OPEN'
-
-    def __send_data_channel_message(self, msg_type, data):
-        """Sends message to the peer through the data channel
-
-        Message is dropped if the channel is not open.
-
-        Arguments:
-            msg_type {string} -- the type of message being sent
-            data {dict} -- data to send, this is JSON serialized.
-        """
-
-        if not self.is_data_channel_ready():
-            logger.debug(
-                "skipping messaage because data channel is not ready: %s" % msg_type)
-            return
-
-        msg = {
-            "type": msg_type,
-            "data": data,
-        }
-        self.data_channel.emit("send-string", json.dumps(msg))
-
-    def __on_offer_created(self, promise, _, __):
-        """Handles on-offer-created promise resolution
-
-        The offer contains the local description.
-        Generate a set-local-description action with the offer.
-        Sends the offer to the on_sdp handler.
-
-        Arguments:
-            promise {GstPromise} -- the promise
-            _ {object} -- unused
-            __ {object} -- unused
-        """
-
-        promise.wait()
-        reply = promise.get_reply()
-        offer = reply.get_value('offer')
-        promise = Gst.Promise.new()
-        self.webrtcbin.emit('set-local-description', offer, promise)
-        promise.interrupt()
-        loop = asyncio.new_event_loop()
-        loop.run_until_complete(self.on_sdp('offer', offer.sdp.as_text()))
-
-    def __on_negotiation_needed(self, webrtcbin):
-        """Handles on-negotiation-needed signal, generates create-offer action
-
-        Arguments:
-            webrtcbin {GstWebRTCBin gobject} -- webrtcbin gobject
-        """
-
-        logger.info("handling on-negotiation-needed, creating offer.")
-        promise = Gst.Promise.new_with_change_func(
-            self.__on_offer_created, webrtcbin, None)
-        webrtcbin.emit('create-offer', None, promise)
-
-    def __send_ice(self, webrtcbin, mlineindex, candidate):
-        """Handles on-ice-candidate signal, generates on_ice event
-
-        Arguments:
-            webrtcbin {GstWebRTCBin gobject} -- webrtcbin gobject
-            mlineindex {integer} -- ice candidate mlineindex
-            candidate {string} -- ice candidate string
-        """
-
-        logger.debug("received ICE candidate: %d %s", mlineindex, candidate)
-        loop = asyncio.new_event_loop()
-        loop.run_until_complete(self.on_ice(mlineindex, candidate))
-
-    def start_pipeline(self):
-        """Starts the gstreamer pipeline
-        """
-
-        # Construct the webrtcbin pipeline with video and audio.
-        self.build_webrtcbin_pipeline()
-        self.build_video_pipeline()
-
-        if self.audio:
-            self.build_audio_pipeline()
-
-        # Advance the state of the pipeline to PLAYING.
-        res = self.pipeline.set_state(Gst.State.PLAYING)
-        if res.value_name != 'GST_STATE_CHANGE_SUCCESS':
-            raise GSTWebRTCAppError(
-                "Failed to transition pipeline to PLAYING: %s" % res)
-
-        # Create the data channel, this has to be done after the pipeline is PLAYING.
-        options = Gst.Structure("application/data-channel")
-        options.set_value("ordered", True)
-        options.set_value("max-retransmits", 0)
-        self.data_channel = self.webrtcbin.emit(
-            'create-data-channel', "input", options)
-        self.data_channel.connect('on-open', lambda _: self.on_data_open())
-        self.data_channel.connect('on-close', lambda _: self.on_data_close())
-        self.data_channel.connect('on-error', lambda _: self.on_data_error())
-        self.data_channel.connect(
-            'on-message-string', lambda _, msg: self.on_data_message(msg))
-
-        logger.info("pipeline started")
+    def dump_pipeline(self):
+        details = Gst.DebugGraphDetails.ALL
+        logger.info("dumping pipeline graph: {}".format(Gst.debug_bin_to_dot_file_with_ts(self.pipeline, details, "pipeline")))

@@ -1,4 +1,6 @@
-# Copyright 2020 Google LLC
+#!/bin/bash
+
+# Copyright 2019 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,25 +14,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-apiVersion: v1
-kind: Service
-metadata:
-  name: vdi
-spec:
-  selector:
-    app.kubernetes.io/instance: {{.FullName}}
-    app.kubernetes.io/name: {{.App}}
-  ports:
-    # Port 80 is the default port routed by the pod broker.
-    - port: 80
-      name: web
-      targetPort: 8082
-    - port: 8080
-      name: signalling
-      targetPort: 8080
-    - port: 8081
-      name: xpra
-      targetPort: 8081
-    - port: 8084
-      name: http-status
-      targetPort: 8084
+function watchLogs() {
+  tail -F /var/log/signaling.log | while read line; do
+    ts=$(date)
+    #logDebug "$line"
+    if [[ "${line}" =~ "Exception " ]]; then
+      logInfo "found Exception, exiting."
+      return 1
+    fi
+  done
+}
+
+python -u ./simple_server.py --port 8080 --disable-ssl 2>&1 | tee /var/log/signaling.log &
+
+watchLogs

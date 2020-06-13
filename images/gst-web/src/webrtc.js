@@ -387,7 +387,7 @@ class WebRTCDemo {
      * @param {String} message
      */
     sendDataChannelMessage(message) {
-        if (this._send_channel.readyState === 'open') {
+        if (this._send_channel !== null && this._send_channel.readyState === 'open') {
             this._send_channel.send(message);
         } else {
             this._setError("attempt to send data channel message before channel was open.");
@@ -464,7 +464,7 @@ class WebRTCDemo {
             });
 
         } else {
-            this._setError("unable to fetch connection stats for brower, only Chrome is supported.");
+            this._setError("unable to fetch connection stats for browser, only Chrome is supported.");
         }
     }
 
@@ -495,7 +495,7 @@ class WebRTCDemo {
     /**
      * Initiate connection to signalling server.
      */
-    connect() {
+    connect(user, session_id) {
         // Create the peer connection object and bind callbacks.
         this.peerConnection = new RTCPeerConnection(this.rtcPeerConfig);
         this.peerConnection.ontrack = this._ontrack.bind(this);
@@ -516,7 +516,7 @@ class WebRTCDemo {
             config.iceTransportPolicy = "relay";
             this.peerConnection.setConfiguration(config);
         }
-        this.signalling.connect();
+        this.signalling.connect(user, session_id);
     }
 
     capture_setup() {

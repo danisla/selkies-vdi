@@ -12,19 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM python:3.7
+substitutions:
+  _REGION: us-west1
+  _NAMESPACE: pod-broker-system
 
-ARG GIT_TAG=c775025a168bce4bd87432b415d1e5d805c38ad1
-
-RUN \
-    git clone https://github.com/centricular/gstwebrtc-demos.git && \
-    cd gstwebrtc-demos/signalling && \
-    git checkout ${GIT_TAG} && \
-    pip3 install --user websockets && \
-    cp -R * /opt/
-
-WORKDIR /opt/
-
-COPY entrypoint.sh /
-
-ENTRYPOINT ["/entrypoint.sh"]
+steps:
+  ###
+  # Deploy manifests to cluster.
+  ###
+  - name: "gcr.io/cloud-builders/kubectl"
+    id: deploy-manifests
+    entrypoint: "bash"
+    args:
+      - "-exc"
+      - |
+        sed 's/$${PROJECT_ID}/'${PROJECT_ID}'/g' *-brokerappconfig.yaml | \
+          /builder/kubectl.bash apply -n ${_NAMESPACE} -f -
+    env:
+      - "PROJECT_ID=${PROJECT_ID}"
+      - "CLOUDSDK_CORE_PROJECT=${PROJECT_ID}"
+      - "CLOUDSDK_COMPUTE_REGION=${_REGION}"
+      - "CLOUDSDK_CONTAINER_CLUSTER=broker-${_REGION}"

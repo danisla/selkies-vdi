@@ -150,6 +150,9 @@ class Input {
             }
         }
 
+        // Break if coordinates are invalid, this happens if the video element fails to load.
+        if (isNaN(this.x) || isNaN(this.y)) return;
+
         var toks = [
             mtype,
             this.x,
@@ -179,6 +182,9 @@ class Input {
         this.x = this._clientToServerX(event.changedTouches[0].clientX);
         this.y = this._clientToServerY(event.changedTouches[0].clientY);
 
+        // Break if coordinates are invalid, this happens if the video element fails to load.
+        if (isNaN(this.x) || isNaN(this.y)) return;
+
         var toks = [
             mtype,
             this.x,
@@ -194,6 +200,9 @@ class Input {
      * @param {MouseWheelEvent} event
      */
     _mouseWheel(event) {
+        // Break if coordinates are invalid, this happens if the video element fails to load.
+        if (isNaN(this.x) || isNaN(this.y)) return;
+
         var mtype = (document.pointerLockElement ? "m2" : "m");
         var button = 3;
         if (event.deltaY < 0) {

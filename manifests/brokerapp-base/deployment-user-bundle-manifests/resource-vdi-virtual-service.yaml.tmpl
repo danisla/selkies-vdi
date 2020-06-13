@@ -39,6 +39,22 @@ spec:
             port:
               number: 8080
     ###
+    # rule for webrtc status
+    ###
+    - match:
+        - uri:
+            prefix: /{{.App}}/status/
+          headers:
+            cookie:
+              regex: ".*broker_{{.App}}={{.CookieValue}}.*"
+      rewrite:
+        uri: /
+      route:
+        - destination:
+            host: {{.FullName}}-{{.ServiceName}}
+            port:
+              number: 8084
+    ###
     # rule for webrtc
     ###
     - match:

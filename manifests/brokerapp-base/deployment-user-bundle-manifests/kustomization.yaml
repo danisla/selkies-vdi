@@ -23,5 +23,6 @@ configMapGenerator:
   - name: webrtc-gpu-streaming-user-manifests-1.4.0
     files:
       - jsonpatch-service-selectors.yaml.tmpl
+      - jsonpatch-virtualservice-session-sharing.yaml.tmpl
       - resource-vdi-service.yaml.tmpl
       - resource-vdi-virtual-service.yaml.tmpl

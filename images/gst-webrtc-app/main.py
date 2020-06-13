@@ -13,78 +13,17 @@
 # limitations under the License.
 
 import argparse
-import asyncio
-import http.client
 import json
 import logging
 import os
 import socket
 import sys
 import time
-import urllib.parse
 
-from webrtc_input import WebRTCInput
-from webrtc_signalling import WebRTCSignalling, WebRTCSignallingErrorNoPeer
-from gstwebrtc_app import GSTWebRTCApp
-from gpu_monitor import GPUMonitor
-from metrics import Metrics
+from gstwebrtc_conference import GSTWebRTCConference
 
-
-def fetch_coturn(uri, user, auth_header_name):
-    """Fetches TURN uri from a coturn web API
-
-    Arguments:
-        uri {string} -- uri of coturn web service, example: http://localhost:8081/
-        user {string} -- username used to generate coturn credential, for example: <hostname>
-
-    Raises:
-        Exception -- if response http status code is >= 400
-
-    Returns:
-        [string] -- TURN URI used with gstwebrtcbin in the form of:
-                        turn://<user>:<password>@<host>:<port>
-                    NOTE that the user and password are URI encoded to escape special characters like '/'
-    """
-
-    parsed_uri = urllib.parse.urlparse(uri)
-
-    conn = http.client.HTTPConnection(parsed_uri.netloc)
-    auth_headers = {
-        auth_header_name: user
-    }
-
-    conn.request("GET", parsed_uri.path, headers=auth_headers)
-    resp = conn.getresponse()
-    if resp.status >= 400:
-        raise Exception(resp.reason)
-
-    ice_servers = json.loads(resp.read())['iceServers']
-    stun = turn = ice_servers[0]['urls'][0]
-    stun_host = stun.split(":")[1]
-    stun_port = stun.split(":")[2].split("?")[0]
-
-    stun_uri = "stun://%s:%s" % (
-        stun_host,
-        stun_port
-    )
-
-    turn_uris = []
-    for turn in ice_servers[1]['urls']:
-        turn_host = turn.split(':')[1]
-        turn_port = turn.split(':')[2].split('?')[0]
-        turn_user = ice_servers[1]['username']
-        turn_password = ice_servers[1]['credential']
-
-        turn_uri = "turn://%s:%s@%s:%s" % (
-            urllib.parse.quote(turn_user, safe=""),
-            urllib.parse.quote(turn_password, safe=""),
-            turn_host,
-            turn_port
-        )
-
-        turn_uris.append(turn_uri)
-
-    return stun_uri, turn_uris
+import logging
+logger = logging.getLogger("main")
 
 def wait_for_app_ready(ready_file, app_auto_init = True):
     """Wait for streaming app ready signal.
@@ -95,34 +34,13 @@ def wait_for_app_ready(ready_file, app_auto_init = True):
         app_auto_init {bool} -- skip wait for appready file (default: {True})
     """
 
-    logging.info("Waiting for streaming app ready")
-    logging.debug("app_auto_init=%s, ready_file=%s" % (app_auto_init, ready_file))
+    logger.info("Waiting for streaming app ready")
+    logger.debug("app_auto_init=%s, ready_file=%s" % (app_auto_init, ready_file))
 
     while not (app_auto_init or os.path.exists(ready_file)):
         time.sleep(0.2)
 
-def set_json_app_argument(config_path, key, value):
-    """Writes kv pair to json argument file
 
-    Arguments:
-        config_path {string} -- path to json config file, example: /var/run/appconfig/streaming_args.json
-        key {string} -- the name of the argument to set
-        value {any} -- the value of the argument to set
-    """
-
-    if not os.path.exists(config_path):
-        # Create new file
-        with open(config_path, 'w') as f:
-            json.dump({}, f)
-
-    # Read current config JSON
-    json_data = json.load(open(config_path))
-
-    # Set the new value for the argument.
-    json_data[key] = value
-
-    # Save the json file
-    json.dump(json_data, open(config_path, 'w'))
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -130,6 +48,14 @@ if __name__ == '__main__':
                         default=os.environ.get(
                             'JSON_CONFIG', '/var/run/appconfig/streaming_args.json'),
                         help='Path to JSON file containing argument key-value pairs that are overlayed with cli args/env.')
+    parser.add_argument('--metadata_url',
+                        default=os.environ.get(
+                            'METADATA_URL', ''),
+                        help='URL to metadata service where session info and sharing key is obtained')
+    parser.add_argument('--sharing_enabled',
+                        default=os.environ.get(
+                            'SHARING_ENABLED', 'false'),
+                        help='enable session sharing, true or false, default: false')
     parser.add_argument('--server',
                         default=os.environ.get(
                             'SIGNALLING_SERVER', 'ws://127.0.0.1:8080'),
@@ -167,6 +93,9 @@ if __name__ == '__main__':
     parser.add_argument('--framerate',
                         default=os.environ.get('WEBRTC_FRAMERATE', '30'),
                         help='framerate of streaming pipeline')
+    parser.add_argument('--resolution',
+                        default=os.environ.get('RESOLUTION', "1920x1080"),
+                        help='default resolution to set X display to')
     parser.add_argument('--encoder',
                         default=os.environ.get('WEBRTC_ENCODER', 'nvh264enc'),
                         help='gstreamer encoder plugin to use')
@@ -189,10 +118,10 @@ if __name__ == '__main__':
                     args.enable_audio = str((str(v).lower() == 'true')).lower()
                 if k == "encoder":
                     args.ecoder = v.lower()
+                if k == "resolution":
+                    args.resolution = v.lower()
         except Exception as e:
-            logging.error("failed to load json config from %s: %s" % (args.json_config, str(e)))
-
-    logging.warn(args)
+            logger.error("failed to load json config from %s: %s" % (args.json_config, str(e)))
 
     # Set log level
     if args.debug:
@@ -200,126 +129,40 @@ if __name__ == '__main__':
     else:
         logging.basicConfig(level=logging.INFO)
 
+    logger.warning(args)
+
     # Wait for streaming app to initialize
     wait_for_app_ready(args.app_ready_file, args.app_auto_init == "true")
 
     # Peer id for this app, default is 0, expecting remote peer id to be 1
-    my_id = 0
-    peer_id = 1
+    my_id = 'webrtc@localhost'
 
-    # Initialize metrics server.
-    metrics = Metrics(int(args.metrics_port))
+    # Initialize conference
+    conference = GSTWebRTCConference(
+        server_id = my_id,
+        metadata_url = args.metadata_url,
+        sharing_enabled = args.sharing_enabled.lower() == "true",
+        signalling_server = args.server,
+        metrics_port = int(args.metrics_port),
+        framerate = int(args.framerate),
+        resolution = args.resolution,
+        enable_audio = args.enable_audio.lower() == "true",
+        uinput_mouse_socket = args.uinput_mouse_socket,
+        uinput_js_socket = args.uinput_js_socket,
+        enable_clipboard = args.enable_clipboard.lower(),
+        config_path = args.json_config,
+        coturn_web_uri = args.coturn_web_uri,
+        coturn_web_username = args.coturn_web_username,
+        coturn_auth_header_name = args.coturn_auth_header_name,
+        encoder = args.encoder
+    )
 
-    # Initialize the signalling instance
-    signalling = WebRTCSignalling(args.server, my_id, peer_id)
-
-    # Handle errors from the signalling server.
-    async def on_signalling_error(e):
-        if isinstance(e, WebRTCSignallingErrorNoPeer):
-            # Waiting for peer to connect, retry in 2 seconds.
-            time.sleep(2)
-            await signalling.setup_call()
-        else:
-            logging.error("signalling eror: %s", str(e))
-    signalling.on_error = on_signalling_error
-
-    # After connecting, attempt to setup call to peer.
-    signalling.on_connect = signalling.setup_call
-
-    # [START main_setup]
-    # Fetch the turn server and credentials
-    stun_server, turn_servers = fetch_coturn(
-        args.coturn_web_uri, args.coturn_web_username, args.coturn_auth_header_name)
-
-    # Create instance of app
-    app = GSTWebRTCApp(stun_server, turn_servers, args.enable_audio == "true", int(args.framerate), args.encoder)
-
-    # [END main_setup]
-
-    # Send the local sdp to signalling when offer is generated.
-    app.on_sdp = signalling.send_sdp
-
-    # Send ICE candidates to the signalling server.
-    app.on_ice = signalling.send_ice
-
-    # Set the remote SDP when received from signalling server.
-    signalling.on_sdp = app.set_sdp
-
-    # Set ICE candidates received from signalling server.
-    signalling.on_ice = app.set_ice
-
-    # Start the pipeline once the session is established.
-    signalling.on_session = app.start_pipeline
-
-    # Initialize the Xinput instance
-    webrtc_input = WebRTCInput(args.uinput_mouse_socket, args.uinput_js_socket, args.enable_clipboard.lower())
-
-    # Log message when data channel is open
-    def data_channel_ready():
-        logging.info(
-            "opened peer data channel for user input to X11")
-
-        app.send_framerate(app.framerate)
-        app.send_audio_enabled(app.audio)
-
-    app.on_data_open = lambda: data_channel_ready()
-
-    # Send incomming messages from data channel to input handler
-    app.on_data_message = webrtc_input.on_message
-
-    # Send video bitrate messages to app
-    webrtc_input.on_video_encoder_bit_rate = lambda bitrate: app.set_video_bitrate(
-        int(bitrate))
-
-    # Send audio bitrate messages to app
-    webrtc_input.on_audio_encoder_bit_rate = lambda bitrate: app.set_audio_bitrate(
-        int(bitrate))
-
-    # Send pointer visibility setting to app
-    webrtc_input.on_mouse_pointer_visible = lambda visible: app.set_pointer_visible(
-        visible)
-
-    # Send clipboard contents when requested
-    webrtc_input.on_clipboard_read = lambda data: app.send_clipboard_data(data)
-
-    # Write framerate arg to local config and then tell client to reload.
-    webrtc_input.on_set_fps = lambda fps: set_json_app_argument(args.json_config, "framerate", fps) or app.send_reload_window() 
-
-    # Write audio enabled arg to local config and then tell client to reload.
-    webrtc_input.on_set_enable_audio = lambda enabled: set_json_app_argument(args.json_config, "enable_audio", enabled) or app.send_reload_window()
-
-    # Send client FPS to metrics
-    webrtc_input.on_client_fps = lambda fps: metrics.set_fps(fps)
-
-    # Send client latency to metrics
-    webrtc_input.on_client_latency = lambda latency_ms: metrics.set_latency(latency_ms)
-
-    # Initialize GPU monitor
-    gpu_mon = GPUMonitor(enabled=args.encoder.startswith("nv"))
-
-    # Send the GPU stats when available.
-    def on_gpu_stats(load, memory_total, memory_used):
-        app.send_gpu_stats(load, memory_total, memory_used)
-        metrics.set_gpu_utilization(load * 100)
-
-    gpu_mon.on_stats = on_gpu_stats
-
-    # [START main_start]
-    # Connect to the signalling server and process messages.
-    loop = asyncio.get_event_loop()
     try:
-        metrics.start()
-        loop.run_until_complete(webrtc_input.connect())
-        loop.run_in_executor(None, lambda: webrtc_input.start_clipboard())
-        loop.run_in_executor(None, lambda: gpu_mon.start())
-        loop.run_until_complete(signalling.connect())
-        loop.run_until_complete(signalling.start())
+        conference.start()
     except Exception as e:
-        logging.error("Caught exception: %s" % e)
+        logger.error("Caught exception: %s" % e)
         sys.exit(1)
     finally:
-        webrtc_input.stop_clipboard()
-        webrtc_input.disconnect()
-        gpu_mon.stop()
+        conference.stop()
         sys.exit(0)
     # [END main_start]

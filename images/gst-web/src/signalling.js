@@ -37,11 +37,8 @@ class WebRTCDemoSignalling {
      *    The URL object of the signalling server to connect to, created with `new URL()`.
      *    Signalling implementation is here:
      *      https://github.com/centricular/gstwebrtc-demos/tree/master/signalling
-     * @param {number} [peer_id]
-     *    The peer ID established during signalling that the sending peer (server) will connect to.
-     *    This can be anything, but must match what the server will attempt to connect to.
      */
-    constructor(server, peer_id) {
+    constructor(server) {
         /**
          * @private
          * @type {URL}
@@ -50,9 +47,22 @@ class WebRTCDemoSignalling {
 
         /**
          * @private
-         * @type {number}
+         * @type {string}
+         * username of the server in the room
          */
-        this._peer_id = peer_id;
+        this.server_username = "webrtc@localhost";
+
+        /**
+         * @private
+         * @type {string}
+         */
+        this.user = null;
+
+        /**
+         * @private
+         * @type {string}
+         */
+        this.session_id = null;
 
         /**
          * @private
@@ -88,6 +98,36 @@ class WebRTCDemoSignalling {
          * @type {function}
          */
         this.onsdp = null;
+
+        /**
+         * @event
+         * @type {function}
+         */
+        this.onroomjoin = null;
+
+        /**
+         * @event
+         * @type {function}
+         */
+        this.onpeerjoin = null;
+
+        /**
+         * @event
+         * @type {function}
+         */
+        this.onpeerleft = null;
+
+        /**
+         * @event
+         * @type {function}
+         */
+        this.onstartsharing = null;
+
+        /**
+         * @event
+         * @type {function}
+         */
+        this.onuserishost = null;
 
         /**
          * @type {string}
@@ -163,8 +203,8 @@ class WebRTCDemoSignalling {
      */
     _onServerOpen() {
         this.state = 'connected';
-        this._ws_conn.send('HELLO ' + this._peer_id);
-        this._setStatus("Registering with server, peer ID: " + this._peer_id);
+        this._ws_conn.send('HELLO ' + this.user);
+        this._setStatus("Registering with server, peer ID: " + this.user);
     }
 
     /**
@@ -199,8 +239,35 @@ class WebRTCDemoSignalling {
         this._setDebug("server message: " + event.data);
 
         if (event.data === "HELLO") {
+            this._ws_conn.send('ROOM ' + this.session_id);
+            this._setStatus("Joining session: " + this.session_id);
+            return;
+        }
+
+        if (event.data.startsWith("ROOM_OK")) {
+            var peers = event.data.split(" ").splice(1);
+
+            // if we are the first peer to join, the list of peers is empty, remove empty entry.
+            peers = (peers[0] === "") ? [] : peers;
+
             this._setStatus("Registered with server.");
             this._setStatus("Waiting for video stream.");
+
+            if (this.onroomjoin !== null) {
+                this.onroomjoin(peers.concat(this.user));
+            }
+            return
+        }
+
+        if (event.data.endsWith("user_is_host")) {
+            if (this.onuserishost !== null) {
+                this.onuserishost();
+            }
+            return;
+        }
+
+        if (event.data.endsWith("waiting_for_host")) {
+            this._setStatus("Waiting for host to start session");
             return;
         }
 
@@ -210,10 +277,42 @@ class WebRTCDemoSignalling {
             return;
         }
 
+        var serverMsgPrefix = `ROOM_PEER_MSG ${this.server_username}`;
+        var serverMsg;
+        if (event.data.startsWith("ROOM_PEER")) {
+            if (event.data.startsWith(serverMsgPrefix)) {
+                serverMsg = event.data.replace(serverMsgPrefix, '').trim();
+                if (serverMsg === "start_sharing") {
+                    if (this.onstartsharing !== null) {
+                        this.onstartsharing();
+                    }
+                    return;
+                }
+            } else if (event.data.startsWith("ROOM_PEER_JOINED")) {
+                var roomPeer = event.data.replace('ROOM_PEER_JOINED ', '');
+                if (roomPeer === this.server_username) {
+                    return;
+                }
+                if (this.onpeerjoin !== null) {
+                    this.onpeerjoin(roomPeer);
+                    return;
+                }
+            } else if (event.data.startsWith("ROOM_PEER_LEFT")) {
+                var roomPeer = event.data.replace('ROOM_PEER_LEFT ', '');
+                if (this.onpeerleft !== null) {
+                    this.onpeerleft(roomPeer);
+                    return;
+                }
+            } else {
+                this._setDebug("ignoring non-server room message: " + event.data);
+                return;
+            }
+        }
+
         // Attempt to parse JSON SDP or ICE message
         var msg;
         try {
-            msg = JSON.parse(event.data);
+            msg = JSON.parse(serverMsg);
         } catch (e) {
             if (e instanceof SyntaxError) {
                 this._setError("error parsing message as JSON: " + event.data);
@@ -245,7 +344,7 @@ class WebRTCDemoSignalling {
             this.state = 'disconnected';
             this._setError("Server closed connection, reconnecting.");
             setTimeout(() => {
-                this.connect();
+                this.connect(this.user, this.session_id);
             }, 3000);
         }
     }
@@ -255,7 +354,9 @@ class WebRTCDemoSignalling {
      * After this is called, a series of handshakes occurs between the signalling
      * server and the server (peer) to negotiate ICE candiates and media capabilities.
      */
-    connect() {
+    connect(user, session_id) {
+        this.user = user;
+        this.session_id = session_id;
         this.state = 'connecting';
         this._setStatus("Connecting to server.");
 
@@ -283,7 +384,7 @@ class WebRTCDemoSignalling {
      */
     sendICE(ice) {
         this._setDebug("sending ice candidate: " + JSON.stringify(ice));
-        this._ws_conn.send(JSON.stringify({ 'ice': ice }));
+        this._ws_conn.send(`ROOM_PEER_MSG ${this.server_username} ${JSON.stringify({ 'ice': ice })}`);
     }
 
     /**
@@ -293,6 +394,13 @@ class WebRTCDemoSignalling {
      */
     sendSDP(sdp) {
         this._setDebug("sending local sdp: " + JSON.stringify(sdp));
-        this._ws_conn.send(JSON.stringify({ 'sdp': sdp }));
+        this._ws_conn.send(`ROOM_PEER_MSG ${this.server_username} ${JSON.stringify({ 'sdp': sdp })}`);
+    }
+
+    /**
+     * Send send-session command.
+     */
+    startSession() {
+        this._ws_conn.send(`ROOM_PEER_MSG ${this.server_username} start_session`);
     }
 }

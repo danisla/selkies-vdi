@@ -45,7 +45,7 @@
     metadata:
       name: persist
       annotations:
-        gke.accel.vdi/user: "{{.User}}"
+        app.broker/user: "{{.User}}"
     spec:
       accessModes: [ "{{ default "ReadWriteOnce" .AppParams.persistVolumeMode }}" ]
       storageClassName: {{ $storageClass | quote }}

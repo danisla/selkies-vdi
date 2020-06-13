@@ -57,6 +57,12 @@ var app = new Vue({
                 { text: '60 fps', value: 60 },
                 { text: '100 fps', value: 100 },
             ],
+            videoResolution: (parseInt(window.localStorage.getItem("videoResolution")) || "1920x1080"),
+            videoResolutionOptions: [
+                { text: '1280x720', value: '1280x720' },
+                { text: '1920x1080', value: '1920x1080' },
+                { text: '2560x1440', value: '2560x1440' },
+            ],
             audioBitRate: (parseInt(window.localStorage.getItem("audioBitRate")) || 32000),
             audioBitRateOptions: [
                 { text: '32 kb/s', value: 32000 },
@@ -65,6 +71,15 @@ var app = new Vue({
                 { text: '256 kb/s', value: 256000 },
                 { text: '320 kb/s', value: 320000 },
             ],
+            derivedUsername: '',
+            rtcConfig: null,
+            hostUser: '',
+            sharingEnabled: false,
+            sharingKey: '',
+            sharingDialog: false,
+            sharingURL: '',
+            sessionPeers: [],
+            sessionPeerInputStates: {},
             showStart: false,
             showDrawer: false,
             logEntries: [],
@@ -74,8 +89,8 @@ var app = new Vue({
             clipboardStatus: 'disabled',
             gamepadState: 'disconnected',
             gamepadName: 'none',
-            audioEnabled: null,
             windowResolution: "",
+            audioEnabled: false,
             connectionStatType: "unknown",
             connectionLatency: 0,
             connectionVideoLatency: 0,
@@ -103,6 +118,8 @@ var app = new Vue({
             publishingAppDescription: "",
             publishingAppIcon: "",
             publishingValid: false,
+            showAlert: false,
+            alertText: "",
             rules: {
                 required: value => {
                     if (!value || value.length == 0)
@@ -129,7 +146,14 @@ var app = new Vue({
     methods: {
         getUsername: () => {
             if (app === undefined) return "webrtc";
+            if (app.derivedUsername.length > 0) return app.derivedUsername;
             return (getCookieValue("broker_" + app.appName) || "webrtc").split("#")[0];
+        },
+        isHost() {
+            return (this.getUsername() === this.hostUser);
+        },
+        getSessionID: () => {
+            return this.sharingKey;
         },
         enterFullscreen() {
             // Request full screen mode.
@@ -148,6 +172,25 @@ var app = new Vue({
                 .catch(err => {
                     webrtc._setError('Failed to read clipboard contents: ' + err);
                 });
+        },
+        showSharingDialog() {
+            if (this.isHost()) {
+                this.sharingDialog = true;
+            }
+        },
+        startSession() {
+            console.log(`starting session, peers: ${app.sessionPeers.join(", ")}`);
+            webrtc.signalling.startSession();
+        },
+        isPeerInputEnabled(peer) {
+            var state = app.sessionPeerInputStates[peer];
+            return (state === true);
+        },
+        setPeerInput(peer, enabled) {
+            if (!this.isHost()) return;
+            console.log('setting input for peer: ' + peer + ', to: ' + enabled);
+            state = (enabled === true) ? "1" : "0";
+            webrtc.sendDataChannelMessage("pi," + peer + "," + state);
         },
         publish() {
             var data = {
@@ -188,6 +231,11 @@ var app = new Vue({
             console.log("video frame rate changed to " + newValue);
             webrtc.sendDataChannelMessage('_arg_fps,' + newValue);
             window.localStorage.setItem("videoFramerate", newValue.toString());
+        },
+        videoResolution(newValue) {
+            console.log("video resolution changed to " + newValue);
+            webrtc.sendDataChannelMessage('_arg_resolution,' + newValue);
+            window.localStorage.setItem("videoResolution", newValue.toString());
         },
         audioEnabled(newValue, oldValue) {
             console.log("audio enabled changed from " + oldValue + " to " + newValue);
@@ -234,7 +282,7 @@ var videoElement = document.getElementById("stream");
 
 // WebRTC entrypoint, connect to the signalling server
 /*global WebRTCDemoSignalling, WebRTCDemo*/
-var signalling = new WebRTCDemoSignalling(new URL("wss://" + window.location.host + "/" + app.appName + "/signalling/"), 1);
+var signalling = new WebRTCDemoSignalling(new URL("wss://" + window.location.host + window.location.pathname + "signalling/"));
 var webrtc = new WebRTCDemo(signalling, videoElement);
 
 // Function to add timestamp to logs.
@@ -250,6 +298,41 @@ signalling.onstatus = (message) => {
     app.logEntries.push(applyTimestamp("[signalling] " + message));
 };
 signalling.onerror = (message) => { app.logEntries.push(applyTimestamp("[signalling] [ERROR] " + message)) };
+signalling.onpeerjoin = (peer_id) => {
+    if (peer_id === signalling.server_username) {
+        if (app.sessionPeers.length === 0 || (app.sessionPeers.length === 1 && app.sessionPeers[0] === app.hostUser)) {
+            app.startSession();
+        } else {
+            app.showSharingDialog();
+        }
+    } else {
+        console.log("peer joined: ", peer_id);
+        app.sessionPeers.push(peer_id);
+        app.showSharingDialog();
+    }
+};
+signalling.onpeerleft = (peer_id) => { app.sessionPeers = app.sessionPeers.filter(function (value, index, arr) { return value !== peer_id }) };
+signalling.onroomjoin = (peers) => {
+    console.log(`room joined, peers: ${peers.join(",")}`);
+
+    if (peers.length === 1 && peers[0] === signalling.server_username) {
+        app.startSession();
+    } else {
+        for (var i = 0; i < peers.length; i++) {
+            if (peers[i] !== signalling.server_username) {
+                app.sessionPeers.push(peers[i]);
+            }
+        }
+    }
+}
+signalling.onuserishost = () => {
+    console.log("user is host");
+    app.hostUser = app.getUsername();
+    if (app.sessionPeers.length === 1 && app.sessionPeers[0] === app.hostUser) return;
+    if (app.sessionPeers.length > 0) {
+        app.showSharingDialog();
+    }
+}
 
 // Send webrtc status and error messages to logs.
 webrtc.onstatus = (message) => { app.logEntries.push(applyTimestamp("[webrtc] " + message)) };
@@ -410,8 +493,28 @@ webrtc.onsystemaction = (action) => {
         }, 700);
     } else if (action.startsWith('framerate')) {
         app.videoFramerate = parseInt(action.split(",")[1]);
+    } else if (action.startsWith('supported_resolutions')) {
+        var resolutions = action.split(",")[1].split(";");
+        app.videoResolutionOptions = [];
+        resolutions.forEach((v) => {
+            app.videoResolutionOptions.push({text: v, value: v});
+        });
+    } else if (action.startsWith('resolution')) {
+        app.videoResolution = action.split(",")[1];
     } else if (action.startsWith('audio')) {
         app.audioEnabled = (action.split(",")[1].toLowerCase() === 'true');
+    } else if (action.startsWith('peer_input')) {
+        var [_, peer_id, enabled] = action.split(",");
+        enabled = (enabled.toLowerCase() === "true")
+        app.sessionPeerInputStates[peer_id] = enabled;
+        if (!app.isHost() && peer_id === app.getUsername()) {
+            if (enabled) {
+                app.alertText = "You now have input control";
+            } else {
+                app.alertText = "You no longer have input control";
+            }
+            app.showAlert = true;
+        }
     } else {
         webrtc._setStatus('Unhandled system action: ' + action);
     }
@@ -455,18 +558,55 @@ var checkPublishing = () => {
 checkPublishing();
 
 // Fetch RTC configuration containing STUN/TURN servers.
-fetch("/turn/")
-    .then(function (response) {
-        return response.json();
-    })
-    .then((config) => {
+// Returns a promise.
+async function getTURN() {
+    return fetch("/turn/")
+        .then(response => {
+            return response.json();
+        });
+}
+
+// Fetch the shared session configuration.
+// Returns a promise.
+async function getSessionStatus(n) {
+    return fetch("status/")
+        .then(response => {
+            return response.json();
+        })
+        .catch(err => {
+            if (n === 1) throw err;
+            return new Promise((resolve, reject) => {
+                setTimeout(() => {
+                    getSessionStatus(n - 1).then(resolve).catch(reject);
+                }, 1400);
+            });
+        });
+}
+
+Promise.all([getTURN(), getSessionStatus()])
+    .then((values) => {
+        app.rtcConfig = values[0];
+        if (values[1] !== null) {
+            app.sharingEnabled = values[1].webrtc.sharing_enabled;
+            app.sharingKey = values[1].session_info.session_key;
+            app.sharingURL = `${location.href}${app.sharingKey}/`;
+        } else {
+            app.sharingKey = "none";
+            app.sharingURL = "";
+        }
+        app.derivedUsername = app.rtcConfig.iceServers[1].username.substring(11);
+
         // for debugging, force use of relay server.
         webrtc.forceTurn = app.turnSwitch;
 
         // get initial local resolution
         app.windowResolution = webrtc.input.getWindowResolution();
 
-        app.debugEntries.push(applyTimestamp("[app] using TURN servers: " + config.iceServers[1].urls.join(", ")));
-        webrtc.rtcPeerConfig = config;
-        webrtc.connect();
+        app.debugEntries.push(applyTimestamp("[app] using TURN server: " + app.rtcConfig.iceServers[1].urls[0]));
+        webrtc.rtcPeerConfig = app.rtcConfig;
+
+        // Connect to signaling server.
+        webrtc.connect(app.getUsername(), app.sharingKey);
+    }).catch(err => {
+        console.log("failed to get configuration", err);
     });

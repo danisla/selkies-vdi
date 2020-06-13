@@ -2,8 +2,8 @@
 <html>
 
 <head>
-  <link href="https://fonts.googleapis.com/css?family=Roboto:100,300,400,500,700,900|Material+Icons" rel="stylesheet" />
-  <link href="https://cdnjs.cloudflare.com/ajax/libs/vuetify/1.5.14/vuetify.min.css" rel="stylesheet" />
+  <link href="https://fonts.googleapis.com/css?family=Roboto:100,300,400,500,700,900|Material+Icons" rel="stylesheet">
+  <link href="vendor/vuetify.min.css" rel="stylesheet" />
   <style>
     html {
       font-family: Roboto, Arial, sans;
@@ -189,6 +189,11 @@
                 </v-select>
               </p>
               <p>
+                <v-select :items="videoResolutionOptions" label="Video resolution" menu-props="left"
+                  v-model="videoResolution" hint="Resolution selection, will reload window on change" persistent-hint>
+                </v-select>
+              </p>
+              <p>
                 <v-select :items="audioBitRateOptions" label="Audio bit rate" menu-props="left" v-model="audioBitRate"
                   :disabled="!audioEnabled" hint="Dynamic bit rate selection for audio encoder on server"
                   persistent-hint>
@@ -236,6 +241,44 @@
                 <v-switch v-model="debug" :label="`Debug logs: ${debug.toString()}`"></v-switch>
                 <v-switch v-model="turnSwitch" :label="`Force relay connection: ${turnSwitch.toString()}`"></v-switch>
               </p>
+
+              <div v-if="sharingEnabled">
+                <p>
+                  Session Sharing
+                <p>
+                  <a :href="sharingURL" style="font-size: 2em">{{ sharingKey }}</a>
+                </p>
+                <div v-if="sessionPeers.length > 0">Connected peers:</div>
+              </div>
+
+              <v-container pa-0 v-if="sharingEnabled">
+                <v-layout pa-1 my-0 row wrap align-center justify-start v-for="peer in sessionPeers">
+                  <v-flex xs1 pa-0>
+                    <v-tooltip bottom v-if="isPeerInputEnabled(peer)">
+                      <template v-slot:activator="{ on }">
+                        <v-btn my-0 block icon v-on:click="setPeerInput(peer, false)">
+                          <v-icon color="black" v-on="on">mouse</v-icon>
+                        </v-btn>
+                      </template>
+                      <span>User has control, click to disable</span>
+                    </v-tooltip>
+                    <v-tooltip bottom v-else>
+                      <template v-slot:activator="{ on }">
+                        <v-btn my-0 block icon v-on:click="setPeerInput(peer, true)">
+                          <v-icon color="grey" v-on="on">mouse</v-icon>
+                        </v-btn>
+                      </template>
+                      <span>Click to grant control</span>
+                    </v-tooltip>
+                  </v-flex>
+                  <v-flex xs6 pa-0>
+                    {{ peer }}
+                  </v-flex>
+                </v-layout>
+              </v-container>
+              <v-btn v-if="sharingEnabled && sessionPeers.length > 0 && isHost()" color="primary" text
+                @click="startSession()">Start
+                Sharing</v-btn>
 
               <p v-if="publishingAllowed">
                 Publishing
@@ -295,15 +338,53 @@
             start</v-btn>
         </div>
       </div>
+
+      <v-dialog v-model="sharingDialog" max-width="320">
+        <v-card>
+          <v-card-title class="headline">Ready to share</v-card-title>
+
+          <v-card-text>
+            <p>
+              The following users are ready to share the session:
+            <ul>
+              <li v-for="peer in sessionPeers">{{ peer }}</li>
+            </ul>
+            </p>
+            <p>
+              Click Start Session when all users have joined.
+            </p>
+          </v-card-text>
+
+          <v-card-actions>
+            <v-spacer></v-spacer>
+
+            <v-btn color="grey darken-1" text @click="sharingDialog = false">
+              Dismiss
+            </v-btn>
+
+            <v-btn color="grey lighten-2" text @click="sharingDialog = false; app.startSession();">
+              Start Session
+            </v-btn>
+          </v-card-actions>
+        </v-card>
+      </v-dialog>
+
+      <!-- Notify shared users who has control -->
+      <v-snackbar v-model="showAlert" :timeout="4000" :top="true">
+        {{alertText}}
+        <v-btn color="pink" flat @click="showAlert = false">
+          Hide
+        </v-btn>
+      </v-snackbar>
     </v-app>
   </div>
 </body>
 
-<script src="https://webrtc.github.io/adapter/adapter-latest.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/apache-guacamole-client@0.9.14/dist/guacamole.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/vue/2.6.9/vue.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/vuetify/1.5.14/vuetify.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/vue-spinner@1.0.3/dist/vue-spinner.min.js"></script>
+<script src="vendor/webrtc-adapter-latest.js"></script>
+<script src="vendor/guacamole.js"></script>
+<script src="vendor/vue.min.js"></script>
+<script src="vendor/vuetify.min.js"></script>
+<script src="vendor/vue-spinner.min.js"></script>
 <script src="gamepad.js?ts=1"></script>
 <script src="input.js?ts=1"></script>
 <script src="signalling.js?ts=1"></script>

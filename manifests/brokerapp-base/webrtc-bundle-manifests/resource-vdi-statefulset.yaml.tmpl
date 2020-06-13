@@ -13,6 +13,9 @@
 # limitations under the License.
 
 {{- if eq .AppSpec.Type "statefulset" }}
+
+{{- $sessionKey := default "" .AppParams.sessionKey }}
+
 apiVersion: v1
 kind: Service
 metadata:
@@ -31,13 +34,17 @@ spec:
     - port: 8081
       name: xpra
       targetPort: 8081
+    - port: 8084
+      name: http-status
+      targetPort: 8084
 ---
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   name: vdi
   annotations:
-    gke.accel.vdi/user: "{{.User}}"
+    app.broker/user: "{{.User}}"
+    app.broker/session-key: "{{ $sessionKey }}"
 spec:
   selector:
     matchLabels:
@@ -48,7 +55,8 @@ spec:
   template:
     metadata:
       annotations:
-        gke.accel.vdi/user: "{{.User}}"
+        app.broker/user: "{{.User}}"
+        app.broker/session-key: "{{ $sessionKey }}"
       labels:
         app: vdi
     spec:
@@ -226,6 +234,9 @@ spec:
           env:
             - name: GST_DEBUG
               value: "*:2"
+              #value: "GST_DEBUG=4,*webrtc*:4"
+            - name: GST_DEBUG_DUMP_DOT_DIR
+              value: "/opt/app"
             - name: LD_LIBRARY_PATH
               value: "/usr/local/nvidia/lib64:/usr/local/nvidia/cuda/lib64:/usr/local/nvidia/lib32"
             - name: DISPLAY
@@ -247,6 +258,10 @@ spec:
               value: "{{.AppParams.enableClipboard}}"
             {{- end}}
 
+            # Add URL to deployment/statefulset metadata broker endpoint.
+            - name: METADATA_URL
+              value: "http://pod-broker.pod-broker-system.svc.cluster.local:8080/{{.App}}/metadata/?broker_{{.App}}={{.CookieValue | replace "#" "%23"}}"
+            
             # Add WEBRTC_ prefixed environment vars from brokerappconfig spec.
             {{- range $item := .AppSpec.AppEnv }}
             {{- if hasPrefix "WEBRTC_" $item.Name }}
@@ -291,6 +306,7 @@ spec:
                   /etc/nginx/conf.d/default.conf
 
               exec nginx -g 'daemon off;'
+          volumeMounts: []
           ports:
             - name: web
               containerPort: 8082

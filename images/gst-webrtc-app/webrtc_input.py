@@ -101,6 +101,8 @@ class WebRTCInput:
         self.xdisplay = None
         self.button_mask = 0
 
+        self.supported_resolutions = self.__get_supported_resolutions()
+
         self.on_video_encoder_bit_rate = lambda bitrate: logger.warn(
             'unhandled on_video_encoder_bit_rate')
         self.on_audio_encoder_bit_rate = lambda bitrate: logger.warn(
@@ -115,6 +117,8 @@ class WebRTCInput:
             'unhandled on_set_enable_audio')
         self.on_client_fps = lambda fps: logger.warn(
             'unhandled on_client_fps')
+        self.on_set_resolution = lambda resolution: logger.warn(
+            'unhandled on_set_resolution')
         self.on_client_latency = lambda latency: logger.warn(
             'unhandled on_client_latency')
 
@@ -128,7 +132,7 @@ class WebRTCInput:
 
     def __mouse_disconnect(self):
         if self.mouse:
-            del self.mouse
+            self.mouse = None
 
     def __mouse_emit(self, *args, **kwargs):
         if self.uinput_mouse_socket_path:
@@ -172,6 +176,16 @@ class WebRTCInput:
             if self.joystick is not None:
                 self.joystick.emit(*args, **kwargs)
 
+    def __get_supported_resolutions(self):
+        logger.info("fetching supported resolutions from xrandr")
+        resolutions = ["1280x720", "1920x1080", "2560x1440"]
+        output = Popen('xrandr --verbose | grep "(0x" | grep -v primary | cut -d" " -f3', shell=True, stdout=PIPE).communicate()[0]
+        for line in output.decode('ascii').strip().split('\n'):
+            if line not in resolutions:
+                resolutions.append(line)
+        logger.info("found %d supported resolutions" % len(resolutions))
+        return resolutions
+
     async def connect(self):
         """Connects to X server
 
@@ -186,6 +200,7 @@ class WebRTCInput:
         self.__mouse_connect()
 
     def disconnect(self):
+        self.stop_clipboard()
         self.__js_disconnect()
         self.__mouse_disconnect()
 
@@ -468,6 +483,14 @@ class WebRTCInput:
             enabled = toks[1].lower() == "true"
             logger.info("Setting enable_audio to: %s" % str(enabled))
             self.on_set_enable_audio(enabled)
+        elif toks[0] == "_arg_resolution":
+            # Set resolution
+            resolution = toks[1].lower()
+            if not resolution in self.supported_resolutions:
+                logger.warning("rejecting resolution because not found in supported resolutions")
+            else:
+                logger.info("setting resolution to: %s" % resolution)
+                self.on_set_resolution(resolution)
         elif toks[0] == "_f":
             # Reported FPS from client.
             fps = int(toks[1])

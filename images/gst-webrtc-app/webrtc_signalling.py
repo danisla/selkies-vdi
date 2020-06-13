@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
+
 import asyncio
 import json
-import logging
 import time
 import websockets
 
@@ -43,37 +44,45 @@ class WebRTCSignallingErrorNoPeer(Exception):
     pass
 
 
+class WebRTCSignallingErrorAlreadyInRoom(Exception):
+    pass
+
+
 class WebRTCSignalling:
-    def __init__(self, server, id, peer_id):
+    def __init__(self, server, id):
         """Initialize the signalling instnance
 
         Arguments:
             server {string} -- websocket URI to connect to, example: ws://127.0.0.1:8080
-            id {integer} -- ID of this client when registering.
-            peer_id {integer} -- ID of peer to connect to.
+            id {string} -- ID of this client when registering.
         """
 
         self.server = server
         self.id = id
-        self.peer_id = peer_id
         self.conn = None
 
-        self.on_ice = lambda mlineindex, candidate: logger.warn(
+        self.on_ice = lambda peer_id, mlineindex, candidate: logger.warning(
             'unhandled ice event')
-        self.on_sdp = lambda sdp_type, sdp: logger.warn('unhandled sdp event')
-        self.on_connect = lambda: logger.warn('unhandled on_connect callback')
-        self.on_session = lambda: logger.warn('unhandled on_session callback')
-        self.on_error = lambda v: logger.warn(
-            'unhandled on_error callback: %s', v)
+        self.on_sdp = lambda peer_id, sdp_type, sdp: logger.warning('unhandled sdp event')
+        self.on_connect = lambda: logger.warning('unhandled on_connect callback')
+        self.on_room_ok = lambda peers: logger.warning('unhandled on_room_ok callback')
+        self.on_room_join = lambda peer_id: logger.warning('unhandled on_room_join callback')
+        self.on_room_leave = lambda peer_id: logger.warning('unhandled on_room_leave callback')
+        self.on_start_session = lambda peer_id: logger.warning('unhandled on_start_session callback')
+        self.on_error = lambda v: logger.warning('unhandled on_error callback: %s', v)
 
-    async def setup_call(self):
+    async def setup_call(self, peer_id):
         """Creates session with peer
 
         Should be called after HELLO is received.
 
         """
         logger.debug("setting up call")
-        await self.conn.send('SESSION %d' % self.peer_id)
+        await self.conn.send('SESSION %s' % peer_id)
+
+    async def join_room(self, room_id):
+        logger.debug("joining room: %s" % room_id)
+        await self.conn.send('ROOM %s' % room_id)
 
     async def connect(self):
         """Connects to and registers id with signalling server
@@ -83,33 +92,47 @@ class WebRTCSignalling:
         """
 
         self.conn = await websockets.connect(self.server)
-        await self.conn.send('HELLO %d' % self.id)
+        await self.conn.send('HELLO %s' % self.id)
 
-    async def send_ice(self, mlineindex, candidate):
-        """Sends te ice candidate to peer
+    async def disconnect(self):
+        logger.info("disconnecting")
+        await self.conn.close()
+
+    async def send_ice(self, peer_id, mlineindex, candidate):
+        """Sends ice candidate to peer
 
         Arguments:
+            peer_id {string} -- peer in room to send to.
             mlineindex {integer} -- the mlineindex
             candidate {string} -- the candidate
         """
 
+        logger.debug("sending ICE candidate to '%s': '%s'" % (peer_id, candidate))
+
         msg = json.dumps(
             {'ice': {'candidate': candidate, 'sdpMLineIndex': mlineindex}})
-        await self.conn.send(msg)
+        await self.conn.send('ROOM_PEER_MSG {} {}'.format(peer_id, msg))
 
-    async def send_sdp(self, sdp_type, sdp):
+    async def send_sdp(self, peer_id, sdp_type, sdp):
         """Sends the SDP to peer
 
         Arguments:
+            peer_id {string} -- peer in room to send to.
             sdp_type {string} -- SDP type, answer or offer.
             sdp {string} -- the SDP
         """
 
-        logger.info("sending sdp type: %s" % sdp_type)
+        logger.info("sending sdp type: %s to %s" % (sdp_type, peer_id))
         logger.debug("SDP:\n%s" % sdp)
 
-        msg = json.dumps({'sdp': {'type': sdp_type, 'sdp': sdp}})
-        await self.conn.send(msg)
+        sdp = json.dumps({'sdp': {'type': sdp_type, 'sdp': sdp}})
+        await self.conn.send('ROOM_PEER_MSG {} {}'.format(peer_id, sdp))
+    
+    async def send_user_is_host(self, peer_id):
+        await self.conn.send('ROOM_PEER_MSG {} user_is_host'.format(peer_id))
+
+    async def send_waiting_for_host(self, peer_id):
+        await self.conn.send('ROOM_PEER_MSG {} waiting_for_host'.format(peer_id))
 
     async def start(self):
         """Handles messages from the signalling server websocket.
@@ -119,47 +142,60 @@ class WebRTCSignalling:
           ERROR*: error messages from server.
           {"sdp": ...}: JSON SDP message
           {"ice": ...}: JSON ICE message
-
-        Callbacks:
-
-        on_connect: fired when HELLO is received.
-        on_session: fired after setup_call() succeeds and SESSION_OK is received.
-        on_error(WebRTCSignallingErrorNoPeer): fired when setup_call() failes and peer not found message is received.
-        on_error(WebRTCSignallingError): fired when message parsing failes or unexpected message is received.
-
         """
         async for message in self.conn:
             if message == 'HELLO':
                 logger.info("connected")
                 await self.on_connect()
-            elif message == 'SESSION_OK':
-                logger.info("started session with peer: %s", self.peer_id)
-                self.on_session()
+            elif message.startswith("ROOM"):
+                logger.info("room message: %s", message)
+
+                if message.startswith("ROOM_OK"):
+                    peers = [p for p in message.replace("ROOM_OK", "").split(" ") if p]
+                    await self.on_room_ok(peers)
+
+                if message.startswith("ROOM_PEER_JOINED"):
+                    await self.on_room_join(message.split(" ")[-1])
+
+                if message.startswith("ROOM_PEER_LEFT"):
+                    await self.on_room_leave(message.split(" ")[-1])
+
+                if message.startswith("ROOM_PEER_MSG"):
+                    peer_id = message.split(" ")[1]
+                    msg = message.replace("ROOM_PEER_MSG {}".format(peer_id), "").strip()
+
+                    if msg.startswith("start_session"):
+                        await self.on_start_session(peer_id)
+                        continue
+
+                    # Attempt to parse JSON SDP or ICE message
+                    data = None
+                    try:
+                        data = json.loads(msg)
+                    except Exception as e:
+                        if isinstance(e, json.decoder.JSONDecodeError):
+                            await self.on_error(WebRTCSignallingError("error parsing message as JSON: %s" % msg))
+                        else:
+                            await self.on_error(WebRTCSignallingError("failed to prase message: %s" % msg))
+                        continue
+                    if data.get("sdp", None):
+                        logger.info("received SDP")
+                        logger.debug("SDP:\n%s" % data["sdp"])
+                        await self.on_sdp(peer_id, data['sdp'].get('type'),
+                                    data['sdp'].get('sdp'))
+                    elif data.get("ice", None):
+                        logger.info("received ICE")
+                        logger.debug("ICE:\n%s" % data.get("ice"))
+                        await self.on_ice(peer_id, data['ice'].get('sdpMLineIndex'),
+                                    data['ice'].get('candidate'))
+                    else:
+                        await self.on_error(WebRTCSignallingError("unhandled JSON message: %s", json.dumps(data)))
+
+
             elif message.startswith('ERROR'):
-                if message == "ERROR peer '%s' not found" % self.peer_id:
-                    await self.on_error(WebRTCSignallingErrorNoPeer("'%s' not found" % self.peer_id))
+                if message == "ERROR peer ":
+                    await self.on_error(WebRTCSignallingErrorNoPeer("'%s' not found" % message.split(" ")[2]))
+                elif message == "ERROR invalid msg, already in room":
+                    await self.on_error(WebRTCSignallingErrorAlreadyInRoom("user is already in room"))
                 else:
                     await self.on_error(WebRTCSignallingError("unhandled signalling message: %s" % message))
-            else:
-                # Attempt to parse JSON SDP or ICE message
-                data = None
-                try:
-                    data = json.loads(message)
-                except Exception as e:
-                    if isinstance(e, json.decoder.JSONDecodeError):
-                        await self.on_error(WebRTCSignallingError("error parsing message as JSON: %s" % message))
-                    else:
-                        await self.on_error(WebRTCSignallingError("failed to prase message: %s" % message))
-                    continue
-                if data.get("sdp", None):
-                    logger.info("received SDP")
-                    logger.debug("SDP:\n%s" % data["sdp"])
-                    self.on_sdp(data['sdp'].get('type'),
-                                data['sdp'].get('sdp'))
-                elif data.get("ice", None):
-                    logger.info("received ICE")
-                    logger.debug("ICE:\n%s" % data.get("ice"))
-                    self.on_ice(data['ice'].get('sdpMLineIndex'),
-                                data['ice'].get('candidate'))
-                else:
-                    await self.on_error(WebRTCSignallingError("unhandled JSON message: %s", json.dumps(data)))

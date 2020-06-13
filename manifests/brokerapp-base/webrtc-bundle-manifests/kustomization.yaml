@@ -44,6 +44,7 @@ configMapGenerator:
       - jsonpatch-deploy-xpra.yaml.tmpl
       - jsonpatch-deploy-recording.yaml.tmpl
       - jsonpatch-deploy-squid-proxy.yaml.tmpl
+      - jsonpatch-deploy-shared-session.yaml.tmpl
       - jsonpatch-deploy-shared-storage-cephfs.yaml.tmpl
       - jsonpatch-deploy-app-proxy.yaml.tmpl
       - jsonpatch-deploy-shared-storage-nfs.yaml.tmpl
@@ -55,3 +56,4 @@ configMapGenerator:
       - jsonpatch-service-file-manager.yaml.tmpl
       - jsonpatch-virtualservice-app-proxy.yaml.tmpl
       - jsonpatch-virtualservice-file-manager.yaml.tmpl
+      - jsonpatch-virtualservice-session-sharing.yaml.tmpl
