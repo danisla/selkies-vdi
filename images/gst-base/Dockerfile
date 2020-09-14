@@ -170,3 +170,33 @@ RUN \
     cd /opt/gst-plugins-ugly && \
     meson build --prefix=/usr && \
     ninja -C build install
+
+# Build and install Intel Media SDK
+RUN \
+    apt-get install -y cmake libudev-dev
+
+ARG LIBVA_VERSION=2.8.0
+RUN \
+    git clone --depth 1 https://github.com/intel/libva.git -b ${LIBVA_VERSION} /opt/libva && \
+    cd /opt/libva && \
+    meson build --prefix=/usr && \
+    ninja -C build install
+
+ARG INTEL_MEDIA_SDK_VERSION=intel-mediasdk-20.2.1
+RUN \
+    mkdir -p /opt/intel/msdk && \
+    git clone --depth 1 https://github.com/Intel-Media-SDK/MediaSDK.git -b ${INTEL_MEDIA_SDK_VERSION} /opt/intel/msdk && \
+    cd /opt/intel/msdk && \
+    (mkdir build && cd build && cmake .. -G Ninja) && \
+    ninja -C build install
+
+# Build and install the gstreamer-media-SDK plugin
+
+ARG GSTREAMER_MEDIA_SDK_VERSION=v1.3.3
+COPY gstreamer-media-sdk-v1.3.3.patch /tmp/
+RUN \
+    git clone --depth 1 https://github.com/intel/gstreamer-media-SDK.git -b ${GSTREAMER_MEDIA_SDK_VERSION} /opt/gstreamer-media-sdk && \
+    cd /opt/gstreamer-media-sdk && \
+    patch -p0 < /tmp/gstreamer-media-sdk-v1.3.3.patch && \
+    (mkdir build && cd build && cmake .. -G Ninja -DUSE_VP8_DECODER=yes -DWITH_WAYLAND=no -DMFX_HOME=/opt/intel/mediasdk -DWITH_X11=yes -DUSE_EGL_RENDERER=no -DUSE_DRI3_RENDERER=no) && \
+    ninja -C build install
