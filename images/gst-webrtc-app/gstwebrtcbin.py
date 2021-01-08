@@ -141,6 +141,16 @@ class GSTWebRTCBin:
             raise GSTWebRTCBinError('Received ICE before session started')
 
         self.webrtcbin.emit('add-ice-candidate', mlineindex, candidate)
+    
+    def close_data_channel(self):
+        if self.data_channel:
+            self.data_channel.close()
+    
+    def is_data_channel_closed(self):
+        if not self.data_channel:
+            return True
+
+        return self.data_channel.get_property("ready-state").value_name == 'GST_WEBRTC_DATA_CHANNEL_STATE_CLOSED'
 
     def is_data_channel_ready(self):
         """Checks to see if the data channel is open.

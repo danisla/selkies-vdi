@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import GPUtil
 import time
 
@@ -28,13 +29,13 @@ class GPUMonitor:
         self.on_stats = lambda load, memoryTotal, memoryUsed: logger.warn(
             "unhandled on_stats")
 
-    def start(self):
+    async def start(self):
         self.running = True
         while self.running:
             if self.enabled:
                 gpu = GPUtil.getGPUs()[0]
                 self.on_stats(gpu.load, gpu.memoryTotal, gpu.memoryUsed)
-            time.sleep(self.period)
+            await asyncio.sleep(self.period)
 
     def stop(self):
         self.running = False

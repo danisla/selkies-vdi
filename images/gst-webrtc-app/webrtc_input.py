@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from Xlib import X, XK, display, ext
+import asyncio
 import base64
 import pynput
 import uinput
@@ -200,7 +201,6 @@ class WebRTCInput:
         self.__mouse_connect()
 
     def disconnect(self):
-        self.stop_clipboard()
         self.__js_disconnect()
         self.__mouse_disconnect()
 
@@ -361,7 +361,7 @@ class WebRTCInput:
         p.communicate(input=data.encode())
         p.wait()
 
-    def start_clipboard(self):
+    async def start_clipboard(self):
         if self.enable_clipboard in ["true", "out"]:
             logger.info("starting clipboard monitor")
             self.clipboard_running = True
@@ -372,7 +372,7 @@ class WebRTCInput:
                     logger.info("sending clipboard content, length: %d" % len(curr_data))
                     self.on_clipboard_read(curr_data)
                     last_data = curr_data
-                time.sleep(0.5)
+                await asyncio.sleep(0.5)
         else:
             logger.info("skipping outbound clipboard service.")
 

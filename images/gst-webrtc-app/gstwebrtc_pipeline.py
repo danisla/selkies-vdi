@@ -155,11 +155,14 @@ class GSTX11StreamingPipeline:
             # Upload buffers from ximagesrc directly to CUDA memory where
             # the colorspace conversion will be performed.
             cudaupload = Gst.ElementFactory.make("cudaupload")
+            cudaupload.set_property("qos", True)
 
             # Convert the colorspace from BGRx to NVENC compatible format.
             # This is performed with CUDA which reduces the overall CPU load
             # compared to using the software videoconvert element.
             cudaconvert = Gst.ElementFactory.make("cudaconvert")
+            cudaconvert.set_property("qos", True)
+
 
             # Convert ximagesrc BGRx format to I420 using cudaconvert.
             # This is a more compatible format for client-side software decoders.
@@ -187,7 +190,7 @@ class GSTX11StreamingPipeline:
             # A Variable Bit Rate (VBR) setting tells the encoder to adjust the
             # compression level based on scene complexity, something not needed
             # when streaming in real-time.
-            nvh264enc.set_property("rc-mode", "cbr")
+            nvh264enc.set_property("rc-mode", "vbr")
 
             # Group of Pictures (GOP) size is the distance between I-Frames that
             # contain the full frame data needed to render a whole frame.
@@ -573,7 +576,21 @@ class GSTX11StreamingPipeline:
         self.peers = max(0, self.peers - 1)
 
         if self.peers == 0:
+            self.pipeline.change_state(Gst.StateChange.PLAYING_TO_PAUSED)
+            self.pipeline.change_state(Gst.StateChange.PAUSED_TO_READY)
             self.pipeline.set_state(Gst.State.NULL)
+
+    def get_state(self):
+        return self.pipeline.get_state(timeout=Gst.SECOND).state
+
+    def is_running(self):
+        return self.get_state() == Gst.State.PLAYING
+    
+    def is_stopped(self):
+        return self.get_state() == Gst.State.NULL
+    
+    def is_ready(self):
+        return self.get_state() == Gst.State.READY
 
     def stop_pipeline(self):
         """Stops the gstreamer pipeline

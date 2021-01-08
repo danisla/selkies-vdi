@@ -299,6 +299,7 @@ signalling.onstatus = (message) => {
 };
 signalling.onerror = (message) => { app.logEntries.push(applyTimestamp("[signalling] [ERROR] " + message)) };
 signalling.onpeerjoin = (peer_id) => {
+    // TODO: this is broken, dialog appears after restarting with all peers.
     if (peer_id === signalling.server_username) {
         if (app.sessionPeers.length === 0 || (app.sessionPeers.length === 1 && app.sessionPeers[0] === app.hostUser)) {
             app.startSession();

@@ -19,7 +19,6 @@ import json
 import logging
 import os
 import sys
-import time
 import urllib.parse
 import subprocess
 
@@ -82,14 +81,15 @@ class GSTWebRTCConference:
         # Host ID is obtained from metadata server as 'user'
         self.host_id                 = None
 
-        self.num_peers = 0
+        self.num_peers_to_link = 0
         self.num_peers_linked = 0
+        self.waiting_room = {}
         self.peers = {}
+        self.sharing_peers = []
         self.loop = None
         self.session_info_running = False
         self.session_info = {}
-
-        self.shutdown = False
+        self.running = False
 
         # Initialize metrics server.
         self.metrics = Metrics(self.metrics_port)
@@ -120,7 +120,8 @@ class GSTWebRTCConference:
             self.uinput_js_socket,
             self.enable_clipboard.lower())
         # Mute the on_clipboard_read callback until a client is bound to it.
-        self.webrtc_input.on_clipboard_read = self.do_nothing
+        #self.webrtc_input.on_clipboard_read = self.do_nothing
+        self.bind_inputs()
         
         # NYI
         self.webrtc_input.on_client_fps = self.do_nothing
@@ -143,11 +144,15 @@ class GSTWebRTCConference:
     # No-op for callbacks.
     def do_nothing(*args):
         pass
+    
+    def get_num_peers(self):
+        return len(self.waiting_room) + len(self.peers)
 
     def bind_inputs(self):
         """Bind the webrtc_input callbacks to the connected peers
         This should be called after all peers have joined.
         """
+
         self.webrtc_input.on_video_encoder_bit_rate = lambda *args: [peer.on_video_encoder_bit_rate(*args) for peer in self.peers.values()]
         self.webrtc_input.on_audio_encoder_bit_rate = lambda *args: [peer.on_audio_encoder_bit_rate(*args) for peer in self.peers.values()]
         self.webrtc_input.on_mouse_pointer_visible = lambda *args: [peer.on_mouse_pointer_visible(*args) for peer in self.peers.values()]
@@ -186,7 +191,7 @@ class GSTWebRTCConference:
         if isinstance(e, WebRTCSignallingErrorAlreadyInRoom):
             logger.error("server already in room, reconnecting.")
             await self.signalling.disconnect()
-            time.sleep(2)
+            await asyncio.sleep(2)
             await self.signalling.connect()
         else:
             logger.error("signalling error: %s", str(e))
@@ -197,7 +202,7 @@ class GSTWebRTCConference:
         # Wait for session info to become available from the metadata server.
         logger.info("Waiting for session info from metadata server")
         while self.room_id is None and self.host_id is None:
-            time.sleep(2)
+            await asyncio.sleep(0.1)
         logger.info("Got session info from metadata, joining room: %s" % self.room_id)
 
         await self.signalling.join_room(self.room_id)
@@ -206,28 +211,70 @@ class GSTWebRTCConference:
     async def on_signalling_room_join(self, peer_id):
         logger.info("peer joined room: {}".format(peer_id))
 
-        self.num_peers += 1
-        if peer_id == self.host_id or self.room_id is None:
-            await self.signalling.send_user_is_host(peer_id)
+        #self.num_peers += 1
+        #if peer_id == self.host_id or self.room_id is None:
+        #    await self.signalling.send_user_is_host(peer_id)
+        #    if peer_id not in self.peers:
+        #        if len(self.peers) > 0:
+        #            # Peers are sharing, but host is reconnecting, restart stream.
+        #            logger.info("Restarting app to reset session")
+        #            self.running = False
+        #        else:
+        #            # Host joined and is only peer, add stream.
+        #            await self.add_peer(peer_id)
+        #else:
+        #    await self.signalling.send_waiting_for_host(peer_id)
 
-            if peer_id not in self.peers:
-                if len(self.peers) > 0:
-                    # Peers are sharing, but host is reconnecting, restart stream.
-                    raise GSTWebRTCConferenceRestartRequiredError("Restarting app to reset session")
-                else:
-                    # Host joined and is only peer, add stream.
-                    await self.add_peer(peer_id)
-        else:
-            await self.signalling.send_waiting_for_host(peer_id)
+        if peer_id not in self.waiting_room:
+            peer = await self.make_peer(peer_id)
+            self.waiting_room[peer_id] = peer
+            logger.info("peer joined waiting room: %s" % peer_id)
+        
+        # Autostart sharing when all peers are present.
+        await self.autostart_sharing()
+        
+        #if peer_id not in self.peers:
+        #    if peer_id == self.host_id:    
+        #        logger.info("peer is host: %s" % peer_id)
+        #    self.num_peers += 1
+        #    await self.add_peer(peer_id)
+    
+    async def autostart_sharing(self):
+        # If peer list is found, and all peers have joined, start the session.
+        if os.path.exists("/var/run/appconfig/sharing_peers.txt"):
+            with open("/var/run/appconfig/sharing_peers.txt", 'r') as f:
+                self.sharing_peers = [line.rstrip() for line in f.readlines()]
+            
+            all_found = True
+            for peer_id in self.sharing_peers:
+                if peer_id not in self.waiting_room:
+                    all_found = False
+                    break
+            
+            if all_found:
+                logger.info("all peers found, starting session")
+                os.unlink("/var/run/appconfig/sharing_peers.txt")
+                await self.start_with_peers()
 
-    async def add_peer(self, peer_id):
+    async def on_signalling_room_leave(self, peer_id):        
+        # Remove peer from waiting room, if present.
+        if peer_id in self.waiting_room:
+            del self.waiting_room[peer_id]
+
+        # Remove peer from active peers.
+        if peer_id in self.peers:
+            self.pipeline.del_webrtcbin(peer_id)
+            del self.peers[peer_id]
+
+        logger.info("peer left: {}, total peers: {}".format(peer_id, self.get_num_peers()))
+
+    async def make_peer(self, peer_id):
         stun_uri, turn_uri = await self.fetch_coturn(
             self.coturn_web_uri,
             "{}-{}".format(peer_id, self.coturn_web_username),
             self.coturn_auth_header_name
         )
 
-        logger.info("host_id: %s, type=%s" % (self.host_id, type(self.host_id)))
         peer = GSTWebRTCPeer(
             loop = self.loop,
             peer_id = peer_id,
@@ -243,27 +290,25 @@ class GSTWebRTCConference:
             on_pad_added = self.on_peer_pad_added,
             shutdown_fn = self.stop
         )
-        self.peers[peer_id] = peer
-        self.pipeline.add_peer(peer.gstwebrtcbin)
+        return peer
 
-        logger.info("added peer: {}, total peers: {}".format(peer_id, self.num_peers))
+    async def add_peer(self, peer):
+        self.peers[peer.peer_id] = peer
+        self.pipeline.add_peer(peer.gstwebrtcbin)
+        logger.info("added peer: {}, total peers: {}".format(peer.peer_id, self.get_num_peers()))
     
     def on_peer_pad_added(self, peer, gstwebrtcbin, pad):
         logger.info("pad added: {}, {}".format(gstwebrtcbin.name, pad.get_property("name")))
 
+    # Called each time a peer is linked to the pipeline.
     def on_linked(self, gstwebrtcbin):
         logger.info("on_linked: {}".format(gstwebrtcbin.name))
 
         # Connect WebRTC handlers now that pipeline is linked with all video and (optional) audio pads.
         gstwebrtcbin.connect_handlers()
 
-        self.num_peers_linked += 1
-        logger.info("peers linked: %d/%d" % (self.num_peers_linked, self.num_peers))
-
-        self.pipeline.start_pipeline()
-
-        logger.info("starting data channel")
-        gstwebrtcbin.start_data_channels()
+        #self.num_peers_linked += 1
+        #logger.info("peers linked: %d/%d" % (self.num_peers_linked, self.num_peers_to_link))
 
         gstwebrtcbin.video_queue.sync_state_with_parent()
         self.pipeline.video_tee.sync_state_with_parent()
@@ -274,38 +319,70 @@ class GSTWebRTCConference:
 
         gstwebrtcbin.webrtcbin.sync_state_with_parent()
 
-        if self.num_peers_linked == self.num_peers:
-            logger.info("binding inputs")
-            self.bind_inputs()
+        logger.info("current state: %s" % self.pipeline.get_state())
 
-    async def on_signalling_room_leave(self, peer_id):
-        self.num_peers = max(0, self.num_peers - 1)
-        logger.info("peer left: {}, total peers: {}".format(peer_id, self.num_peers))
-        self.pipeline.del_webrtcbin(peer_id)
-        del self.peers[peer_id]
+        logger.info("starting data channel")
+        gstwebrtcbin.start_data_channels()
+
+        #if self.num_peers_linked == self.num_peers:
+        #    logger.info("binding inputs")
+        #    self.bind_inputs()
+        #self.bind_inputs()
     
     async def on_signalling_start_session(self, peer_id):
         if peer_id == self.host_id:
-            logger.warning("restarting app to connect to additional peers.")
-            await self.signalling.disconnect()
-            raise GSTWebRTCConferenceRestartRequiredError("Restarting app to start sharing session")
+            await self.start_with_peers()
+            return
+            
+            if len(self.waiting_room) == 1:
+                if self.pipeline.is_running():
+                    logger.warning("will not start when pipeline already running.")
+                else:
+                    await self.start_with_peers()
+            else:
+                logger.info("restarting with list of peers")
+                # Write list of peers to file and restart app.
+                with open("/var/run/appconfig/sharing_peers.txt", 'w') as f:
+                    for peer_id in self.waiting_room.keys():
+                        f.write("%s\n" % peer_id)
+                self.running = False
         else:
             logger.warning("rejecting start share request from {} because user is not host".format(peer_id))
     
+    async def start_with_peers(self):
+        if not self.pipeline.is_running():
+            self.pipeline.start_pipeline()
+
+        # on_linked method is called per peer indicating that peer is linked.
+        # the pipeline is started and transitioned to the PLAYING state after all peers are linked.
+        self.num_peers_to_link = len(self.waiting_room)
+        self.num_peers_linked = 0
+
+        for peer_id, peer in self.waiting_room.items():
+            if peer_id not in self.peers:
+                self.peers[peer_id] = peer
+                await self.add_peer(peer)
+
     async def on_signalling_room_ok(self, peer_ids=[]):
         logger.info("server joined room, peer_ids: {}".format(peer_ids))
-        self.num_peers = len(peer_ids)
 
-        if not self.host_id in peer_ids and self.room_id is not None:
-            logging.info("waiting for host to join before adding other peers.")
-            for peer_id in peer_ids:
-                await self.signalling.send_waiting_for_host(peer_id)
-            return
+        #if not self.host_id in peer_ids and self.room_id is not None:
+        #    logging.info("waiting for host to join before adding other peers.")
+        #    for peer_id in peer_ids:
+        #        await self.signalling.send_waiting_for_host(peer_id)
+        #    return
 
+        #for peer_id in peer_ids:
+        #    if peer_id == self.host_id:
+        #        await self.signalling.send_user_is_host(peer_id)
+        #    await self.add_peer(peer_id)
         for peer_id in peer_ids:
-            if peer_id == self.host_id:
-                await self.signalling.send_user_is_host(peer_id)
-            await self.add_peer(peer_id)
+            peer = await self.make_peer(peer_id)
+            self.waiting_room[peer_id] = peer
+            logger.info("added peer to waiting room: %s" % peer_id)
+        
+        # Autostart sharing when all peers are present.
+        await self.autostart_sharing()
     
     async def on_signalling_sdp(self, peer_id, *args):
         logger.info("on_signalling_sdp: {}".format(peer_id))
@@ -423,57 +500,41 @@ class GSTWebRTCConference:
     def start(self):
         self.loop = asyncio.get_event_loop()
         self.metrics.start()
-        #self.loop.run_until_complete(self.start_web_server())
         self.loop.run_until_complete(self.webrtc_input.connect())
-        self.loop.run_in_executor(None, lambda: self.webrtc_input.start_clipboard())
-        #self.loop.run_in_executor(None, lambda: self.start_session_info_watcher())
-        self.loop.run_in_executor(None, lambda: self.gpu_mon.start())
         self.loop.run_until_complete(self.signalling.connect())
+
         tasks = [
             self.start_session_info_watcher(),
             self.start_web_server(),
+            self.webrtc_input.start_clipboard(),
+            self.gpu_mon.start(),
             self.signalling.start(),
-            self.shutdown_watcher(),
+            self.shutdown(),
         ]
         self.tasks = asyncio.gather(*tasks, loop=self.loop)
+        self.running = True
         self.loop.run_until_complete(self.tasks)
         logger.info("loop complete")
         sys.exit(0)
 
-    async def shutdown_watcher(self):
-        while True:
-            if self.shutdown:
-                self.stop_session_info_watcher()
-                self.webrtc_input.disconnect()
-                self.gpu_mon.stop()
-                await self.stop_web_server()
-                await self.signalling.disconnect()
-                return
-            await asyncio.sleep(0.5)
-    
+    async def shutdown(self):
+        while self.running:
+            await asyncio.sleep(0.2)
+
+        self.stop_session_info_watcher()
+        self.webrtc_input.stop_clipboard()
+        self.webrtc_input.disconnect()
+        self.gpu_mon.stop()
+        await self.stop_web_server()
+        await self.signalling.disconnect()
+            
     async def stop_web_server(self):
         logger.info("Shutting down web server")
         await self.web_app_runner.cleanup()
 
     def stop(self):
-        self.shutdown = True
-        #self.loop.run_forever()
-        #try:
-        #    self.tasks.cancel()
-        #    self.loop.run_forever()
-        #    self.tasks.exception()
-        #    #self.loop.run_until_complete(self.signalling.disconnect())
-        #    #self.loop.stop()
-        #    #await self.signalling.disconnect()
-        #    #await self.stop_web_server()
-        #    #self.webrtc_input.stop_clipboard()
-        #    #self.webrtc_input.disconnect()
-        #    #self.gpu_mon.stop()
-        #    self.session_info_running = False
-        #except Exception as e:
-        #    logger.error("failed graceful shutdown: %s" % str(e))
-        #finally:
-        #    sys.exit(0)
+        logger.info("Shutting down app")
+        self.running = False
 
 class GSTWebRTCPeer:
     """Peer connected to conference
@@ -662,13 +723,17 @@ class GSTWebRTCPeer:
     def on_video_encoder_bit_rate(self, bitrate):
         self.log_info("on_video_encoder_bit_rate")
         if self.input_enabled:
+            self.log_info("setting video bitrate")
             self.pipeline.set_video_bitrate(int(bitrate))
+            self.log_info("sending video bitrate")
             self.send_video_bitrate(self.pipeline.video_bitrate)
     
     def on_audio_encoder_bit_rate(self, bitrate):
         self.log_info("on_audio_encoder_bit_rate")
         if self.input_enabled:
+            self.log_info("setting audio bitrate")
             self.pipeline.set_audio_bitrate(int(bitrate))
+            self.log_info("sending audio bitrate")
             self.send_audio_bitrate(self.pipeline.audio_bitrate)
     
     def on_mouse_pointer_visible(self, visible):
